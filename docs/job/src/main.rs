@@ -86,8 +86,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     // start tracing
-    let subscriber = tracing_subscriber::FmtSubscriber::new();
-    tracing::subscriber::set_global_default(subscriber)?;
+    templemeads::config::initialise_tracing();
 
     // parse the command line arguments
     let args: Args = Args::parse();
@@ -161,7 +160,7 @@ async_runnable! {
 
                 tracing::info!("Here we would implement the business logic to add the user to the cluster");
 
-                job = job.completed("account created")?;
+                job = job.completed("account created".to_string())?;
             }
             RemoveUser(user) => {
                 // remove the user from the cluster
@@ -173,7 +172,7 @@ async_runnable! {
                     job = job.errored(&format!("You are not allowed to remove the account for {:?}",
                                       user.username()))?;
                 } else {
-                    job = job.completed("account removed")?;
+                    job = job.completed("account removed".to_string())?;
                 }
             }
             _ => {
@@ -264,7 +263,7 @@ async fn run_portal(
     let mut service = ServiceConfig::new("portal", url, ip, port, &None, &None)?;
 
     // add the cluster to the portal, returning an invitation
-    let invite = service.add_client("cluster", range)?;
+    let invite = service.add_client("cluster", range, &None)?;
 
     // save the invitation to the requested file
     invite.save(invitation)?;
@@ -300,7 +299,7 @@ async fn run_portal(
     });
 
     // create a job to add a user to the cluster
-    let mut job = Job::parse("portal.cluster add_user fred.proj.org")?;
+    let mut job = Job::parse("portal.cluster add_user fred.proj.portal", true)?;
 
     // put this job to the cluster
     job = job.put(&cluster).await?;
@@ -314,7 +313,7 @@ async fn run_portal(
     tracing::info!("Result: {:?}", result);
 
     // create a job to remove a user from the cluster
-    let mut job = Job::parse("portal.cluster remove_user fred.proj.org")?;
+    let mut job = Job::parse("portal.cluster remove_user fred.proj.portal", true)?;
 
     // put this job to the cluster
     job = job.put(&cluster).await?;
@@ -325,7 +324,7 @@ async fn run_portal(
     tracing::info!("Result: {:?}", result);
 
     // try to remove a user who should not be removed
-    let mut job = Job::parse("portal.cluster remove_user jane.admin.org")?;
+    let mut job = Job::parse("portal.cluster remove_user jane.admin.portal", true)?;
 
     // put this job to the cluster
     job = job.put(&cluster).await?;

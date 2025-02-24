@@ -8,12 +8,17 @@ use futures::{SinkExt, StreamExt};
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, stream::TryStreamExt};
 use secrecy::ExposeSecret;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::env;
+use std::fmt::Display;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::vec::Vec;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as TokioMessage;
+use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::server::{
     ErrorResponse as HandshakeErrorResponse, Request as HandshakeRequest,
     Response as HandshakeResponse,
@@ -21,13 +26,13 @@ use tungstenite::handshake::server::{
 
 use crate::command::Command;
 use crate::config::{ClientConfig, PeerConfig, ServiceConfig};
-use crate::crypto::{Key, SecretKey};
+use crate::crypto::{random_bytes, Key, Salt, SecretKey, KEY_SIZE};
 use crate::error::Error;
 use crate::exchange;
 use crate::message::Message;
 
 #[derive(Debug, Clone, PartialEq)]
-enum ConnectionState {
+enum ConnectionStatus {
     None,
     Connecting,
     Connected,
@@ -36,27 +41,138 @@ enum ConnectionState {
 }
 
 #[derive(Debug, Clone)]
+struct ConnectionState {
+    status: ConnectionStatus,
+    last_activity: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        ConnectionState {
+            status: ConnectionStatus::None,
+            last_activity: chrono::Utc::now(),
+        }
+    }
+}
+
+impl ConnectionState {
+    fn set_error(&mut self) {
+        self.status = ConnectionStatus::Error;
+        self.last_activity = chrono::Utc::now();
+    }
+
+    fn set_disconnected(&mut self) {
+        self.status = ConnectionStatus::Disconnected;
+        self.last_activity = chrono::Utc::now();
+    }
+
+    fn set_connecting(&mut self) -> Result<(), Error> {
+        if self.status == ConnectionStatus::None {
+            self.status = ConnectionStatus::Connecting;
+            self.last_activity = chrono::Utc::now();
+            Ok(())
+        } else {
+            Err(Error::BusyLine(format!(
+                "Connection is already {:?}",
+                self.status
+            )))
+        }
+    }
+
+    fn set_connected(&mut self) -> Result<(), Error> {
+        if self.status == ConnectionStatus::Connecting {
+            self.status = ConnectionStatus::Connected;
+            self.last_activity = chrono::Utc::now();
+            Ok(())
+        } else {
+            Err(Error::BusyLine(format!(
+                "Connection is not connecting - it is {:?}",
+                self.status
+            )))
+        }
+    }
+
+    fn register_activity(&mut self) {
+        self.last_activity = chrono::Utc::now();
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Connection {
-    state: Arc<TokioMutex<ConnectionState>>,
+    state: Arc<StdMutex<ConnectionState>>,
     config: ServiceConfig,
     inner_key: Option<SecretKey>,
     outer_key: Option<SecretKey>,
+    inner_key_salt: Option<Salt>,
+    outer_key_salt: Option<Salt>,
     peer: Option<PeerConfig>,
     tx: Option<Arc<TokioMutex<UnboundedSender<TokioMessage>>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerDetails {
+    name: String,
+    zone: String,
+    version: u32,
+}
+
+impl Display for PeerDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.name, self.zone)
+    }
+}
+
+impl PeerDetails {
+    fn new(name: &str, zone: &str) -> Self {
+        // everything is currently version 1
+        PeerDetails {
+            name: name.to_string(),
+            zone: zone.to_string(),
+            version: 1,
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn zone(&self) -> &str {
+        &self.zone
+    }
+
+    fn version(&self) -> u32 {
+        self.version
+    }
 }
 
 fn envelope_message<T>(
     message: T,
     inner_key: &SecretKey,
     outer_key: &SecretKey,
+    inner_key_salt: &Salt,
+    outer_key_salt: &Salt,
 ) -> Result<TokioMessage, AnyError>
 where
     T: Serialize,
 {
+    // we will now generate per-message keys, using a
+    // random additional info and the salts for this connection
+    let inner_info = random_bytes(KEY_SIZE)?;
+    let outer_info = random_bytes(KEY_SIZE)?;
+
+    let inner_key = inner_key
+        .expose_secret()
+        .derive(inner_key_salt, Some(&inner_info))?;
+    let outer_key = outer_key
+        .expose_secret()
+        .derive(outer_key_salt, Some(&outer_info))?;
+
     Ok(TokioMessage::text(
-        outer_key
-            .expose_secret()
-            .encrypt(inner_key.expose_secret().encrypt(message)?)?,
+        hex::encode(&inner_info)
+            + &hex::encode(&outer_info)
+            + &outer_key
+                .expose_secret()
+                .encrypt(inner_key.expose_secret().encrypt(message)?)?,
     ))
 }
 
@@ -64,24 +180,54 @@ fn deenvelope_message<T>(
     message: TokioMessage,
     inner_key: &SecretKey,
     outer_key: &SecretKey,
+    inner_key_salt: &Salt,
+    outer_key_salt: &Salt,
 ) -> Result<T, AnyError>
 where
     T: DeserializeOwned,
 {
+    let message = message.to_text()?;
+
+    if message.len() < 4 * KEY_SIZE + 2 {
+        tracing::warn!("Message too short to de-envelop: {}", message.len());
+        return Err(Error::Incompatible("Message too short to de-envelop".to_string()).into());
+    }
+
+    // the hex-encoded string is 2 times the number of bytes
+    let inner_info = hex::decode(&message[0..(2 * KEY_SIZE)])?;
+    let outer_info = hex::decode(&message[(2 * KEY_SIZE)..(4 * KEY_SIZE)])?;
+
+    let inner_key = inner_key
+        .expose_secret()
+        .derive(inner_key_salt, Some(&inner_info))?;
+
+    let outer_key = outer_key
+        .expose_secret()
+        .derive(outer_key_salt, Some(&outer_info))?;
+
     Ok(inner_key.expose_secret().decrypt::<T>(
         &outer_key
             .expose_secret()
-            .decrypt::<String>(message.to_text()?)?,
+            .decrypt::<String>(&message[(4 * KEY_SIZE)..])?,
     )?)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Handshake {
+    session_key: SecretKey,
+    engine: String,
+    version: String,
 }
 
 impl Connection {
     pub fn new(config: ServiceConfig) -> Self {
         Connection {
-            state: Arc::new(TokioMutex::new(ConnectionState::None)),
+            state: Arc::new(StdMutex::new(ConnectionState::default())),
             config,
             inner_key: None,
             outer_key: None,
+            inner_key_salt: None,
+            outer_key_salt: None,
             peer: None,
             tx: None,
         }
@@ -91,14 +237,78 @@ impl Connection {
     /// Return the name of the connection - this is the name of the peer
     /// that the connection is connected to.
     ///
-    pub fn name(&self) -> Option<String> {
+    pub fn name(&self) -> String {
         self.peer.as_ref().unwrap_or(&PeerConfig::None).name()
+    }
+
+    ///
+    /// Return the zone of the connection - both sides of the connection
+    /// must agree on the same zone
+    ///
+    pub fn zone(&self) -> String {
+        self.peer.as_ref().unwrap_or(&PeerConfig::None).zone()
+    }
+
+    ///
+    /// Close the connection
+    ///
+    pub async fn disconnect(&mut self) -> Result<(), Error> {
+        if let Some(tx) = self.tx.as_ref() {
+            tracing::warn!(
+                "Disconnecting connection to peer: {}@{}",
+                self.name(),
+                self.zone()
+            );
+            let mut tx = tx.lock().await;
+            tx.close()
+                .await
+                .with_context(|| "Error closing connection")?;
+        }
+
+        Ok(())
+    }
+
+    ///
+    /// Watchdog check the connection is still active
+    ///
+    pub async fn watchdog(&mut self) -> Result<(), Error> {
+        let last_activity = match self.state.lock() {
+            Ok(state) => state.last_activity,
+            Err(e) => {
+                tracing::warn!("Error getting last activity: {:?}", e);
+                // return ok as we will check again
+                return Ok(());
+            }
+        };
+
+        if last_activity < chrono::Utc::now() - chrono::Duration::seconds(300) {
+            tracing::warn!(
+                "*WATCHDOG* Connection to peer: {}@{} has not been active for over 300 seconds - disconnecting",
+                self.name(),
+                self.zone()
+            );
+
+            match self.disconnect().await {
+                Ok(_) => (),
+                Err(e) => {
+                    // only log this, as we are already in a watchdog
+                    tracing::warn!("Error disconnecting connection: {:?}", e);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     ///
     /// Send a message to the peer on the other end of the connection.
     ///
     pub async fn send_message(&self, message: &str) -> Result<(), Error> {
+        if message.is_empty() {
+            tracing::warn!("Empty message - not sending");
+            return Ok(());
+        }
+
         let tx = self.tx.as_ref().ok_or_else(|| {
             tracing::warn!("No connection to send message to!");
             Error::InvalidPeer("No connection to send message to!".to_string())
@@ -116,9 +326,35 @@ impl Connection {
             Error::InvalidPeer("No outer key to send message with!".to_string())
         })?;
 
-        tx.send(envelope_message(message.to_string(), inner_key, outer_key)?)
-            .await
-            .with_context(|| "Error sending message to peer")?;
+        let inner_key_salt = self.inner_key_salt.as_ref().ok_or_else(|| {
+            tracing::warn!("No inner key salt to send message with!");
+            Error::InvalidPeer("No inner key salt to send message with!".to_string())
+        })?;
+
+        let outer_key_salt = self.outer_key_salt.as_ref().ok_or_else(|| {
+            tracing::warn!("No outer key salt to send message with!");
+            Error::InvalidPeer("No outer key salt to send message with!".to_string())
+        })?;
+
+        tx.send(envelope_message(
+            message.to_string(),
+            inner_key,
+            outer_key,
+            inner_key_salt,
+            outer_key_salt,
+        )?)
+        .await
+        .with_context(|| "Error sending message to peer")?;
+
+        // record the last time we successfully sent a message
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.register_activity();
+            }
+            Err(e) => {
+                tracing::warn!("Error registering activity: {:?}", e);
+            }
+        }
 
         Ok(())
     }
@@ -130,8 +366,17 @@ impl Connection {
     /// to error (it will have been automatically closed)
     ///
     pub async fn set_error(&mut self) {
-        let mut state = self.state.lock().await;
-        *state = ConnectionState::Error;
+        self.closed_connection().await;
+
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.set_error();
+            }
+            Err(e) => {
+                tracing::warn!("Error setting connection state to error: {:?}", e);
+            }
+        }
+
         self.tx = None;
         self.inner_key = None;
         self.outer_key = None;
@@ -152,8 +397,14 @@ impl Connection {
                 tracing::error!("Error unregistering connection with exchange: {:?}", e);
             });
 
-        let mut state = self.state.lock().await;
-        *state = ConnectionState::Disconnected;
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.set_disconnected();
+            }
+            Err(e) => {
+                tracing::warn!("Error setting connection state to disconnected: {:?}", e);
+            }
+        }
         self.tx = None;
         self.inner_key = None;
         self.outer_key = None;
@@ -178,16 +429,16 @@ impl Connection {
         };
 
         // now check that we aren't already handling a connection
-        {
-            let mut state = self.state.lock().await;
-            if *state != ConnectionState::None {
-                tracing::warn!("Already handling a connection - closing new connection.");
-                return Err(Error::BusyLine(format!(
-                    "Already handling a connection {:?} - closing new connection.",
-                    state
-                )));
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.set_connecting()?;
             }
-            *state = ConnectionState::Connecting;
+            Err(e) => {
+                tracing::warn!("Error setting connection state to connecting: {:?}", e);
+                return Err(Error::BusyLine(
+                    "Error setting connection state to connecting.".to_string(),
+                ));
+            }
         }
 
         // we now know we are the only ones handling a connection,
@@ -195,13 +446,47 @@ impl Connection {
 
         // save the peer we are connecting to
         self.peer = Some(peer.clone());
-        let peer_name = peer.name().unwrap_or_default();
+        let peer_name = peer.name();
+        let peer_zone = peer.zone();
+
+        // create two salts for the connection
+        let inner_key_salt = Salt::generate()?;
+        let outer_key_salt = Salt::generate()?;
 
         let url = server.get_websocket_url()?.to_string();
 
         tracing::info!("Connecting to WebSocket at: {} - initiating handshake", url);
 
-        let socket = match connect_async(url.clone()).await {
+        // add the salts to the headers, xor'd with the server's keys
+        // (just to keep them more secret)
+        let mut request = url
+            .clone()
+            .into_client_request()
+            .with_context(|| format!("Error creating client request for WebSocket at: {}", url))?;
+
+        request.headers_mut().insert(
+            "openportal-inner-salt",
+            inner_key_salt
+                .xor(server.outer_key().expose_secret())
+                .to_string()
+                .parse()
+                .with_context(|| {
+                    format!("Error parsing inner key salt for WebSocket at: {}", url)
+                })?,
+        );
+
+        request.headers_mut().insert(
+            "openportal-outer-salt",
+            outer_key_salt
+                .xor(server.inner_key().expose_secret())
+                .to_string()
+                .parse()
+                .with_context(|| {
+                    format!("Error parsing outer key salt for WebSocket at: {}", url)
+                })?,
+        );
+
+        let socket = match connect_async(request).await {
             Ok((socket, _)) => socket,
             Err(e) => {
                 tracing::warn!("Error connecting to WebSocket at: {} - {:?}", url, e);
@@ -213,19 +498,31 @@ impl Connection {
         // Split the WebSocket stream into incoming and outgoing parts
         let (mut outgoing, mut incoming) = socket.split();
 
-        // the client generates the new session outer key, and sends this to the server
+        // the client generates a handshake that contains the new session outer key,
+        // the name of its comms engine and version, and sends this to the server
         // using the pre-shared client/server inner and outer keys
         let outer_key = Key::generate();
 
-        let message =
-            match envelope_message(outer_key.clone(), &server.inner_key(), &server.outer_key()) {
-                Ok(message) => message,
-                Err(e) => {
-                    tracing::warn!("Error enveloping message: {:?}", e);
-                    self.set_error().await;
-                    return Err(e.into());
-                }
-            };
+        let handshake = Handshake {
+            session_key: outer_key.clone(),
+            engine: env!("CARGO_PKG_NAME").to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+
+        let message = match envelope_message(
+            handshake,
+            &server.inner_key(),
+            &server.outer_key(),
+            &inner_key_salt,
+            &outer_key_salt,
+        ) {
+            Ok(message) => message,
+            Err(e) => {
+                tracing::warn!("Error enveloping message: {:?}", e);
+                self.set_error().await;
+                return Err(e.into());
+            }
+        };
 
         if let Err(r) = outgoing.send(message).await {
             self.set_error().await;
@@ -253,23 +550,140 @@ impl Connection {
             }
         };
 
-        // the server has generated a new session inner key, and has sent that
+        // the server has generated a new session inner key, and has put this into
+        // a handshake with its comms engine and version, and sent that
         // wrapped using the client/server inner key and the new session outer key
-        let inner_key: SecretKey =
-            match deenvelope_message(response, &server.inner_key(), &outer_key) {
-                Ok(inner_key) => inner_key,
-                Err(e) => {
-                    tracing::warn!("Error de-enveloping message: {:?}", e);
-                    self.set_error().await;
-                    return Err(e.into());
-                }
-            };
+        let handshake: Handshake = match deenvelope_message(
+            response,
+            &server.inner_key(),
+            &outer_key,
+            &inner_key_salt,
+            &outer_key_salt,
+        ) {
+            Ok(inner_key) => inner_key,
+            Err(e) => {
+                tracing::warn!("Error de-enveloping message: {:?}", e);
+                self.set_error().await;
+                return Err(e.into());
+            }
+        };
+
+        let inner_key = handshake.session_key.clone();
+
+        // the final step is for the client to send the server its PeerDetails,
+        // and for the server to respond. These should match up with
+        // what we expect
+        let peer_details = PeerDetails::new(&self.config.name(), &peer_zone);
+
+        let message = match envelope_message(
+            peer_details,
+            &inner_key,
+            &outer_key,
+            &inner_key_salt,
+            &outer_key_salt,
+        ) {
+            Ok(message) => message,
+            Err(e) => {
+                tracing::warn!("Error enveloping message: {:?}", e);
+                self.set_error().await;
+                return Err(e.into());
+            }
+        };
+
+        if let Err(r) = outgoing.send(message).await {
+            self.set_error().await;
+            return Err(Error::Any(r.into()));
+        }
+
+        // receive the response
+        let response = match incoming.next().await {
+            Some(response) => response,
+            None => {
+                tracing::warn!("Error receiving response from peer. Ensure the peer is valid and the connection is open.");
+                self.set_error().await;
+                return Err(Error::InvalidPeer(
+                    "Error receiving response from peer. Ensure the peer is valid and the connection is open.".to_string(),
+                ));
+            }
+        };
+
+        let response = match response {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::warn!("Error receiving response from peer: {:?}", e);
+                self.set_error().await;
+                return Err(Error::Any(e.into()));
+            }
+        };
+
+        // the response should be the server's peer details, which should match what we expect
+        let peer_details: PeerDetails = match deenvelope_message(
+            response,
+            &inner_key,
+            &outer_key,
+            &inner_key_salt,
+            &outer_key_salt,
+        ) {
+            Ok(peer_details) => peer_details,
+            Err(e) => {
+                tracing::warn!("Error de-enveloping message: {:?}", e);
+                self.set_error().await;
+                return Err(e.into());
+            }
+        };
+
+        tracing::info!(
+            "Connecting to peer {}, comms engine {} version {}",
+            peer_details,
+            handshake.engine,
+            handshake.version
+        );
+
+        // eventually we could check the engine and version here,
+        // and do different things based on compatibility, but not for now
+
+        if peer_details.name() != peer_name {
+            tracing::warn!(
+                "Peer name does not match expected name: {} != {}",
+                peer_details.name(),
+                peer_name
+            );
+            self.set_error().await;
+            return Err(Error::InvalidPeer(
+                "Peer name does not match expected name.".to_string(),
+            ));
+        }
+
+        if peer_details.zone() != peer_zone {
+            tracing::warn!(
+                "Peer zone does not match expected zone: {} != {}",
+                peer_details.zone(),
+                peer_zone,
+            );
+            self.set_error().await;
+            return Err(Error::InvalidPeer(
+                "Peer zone does not match expected zone.".to_string(),
+            ));
+        }
+
+        if peer_details.version() != 1 {
+            tracing::warn!(
+                "Peer version does not match expected version: {} != 1",
+                peer_details.version()
+            );
+            self.set_error().await;
+            return Err(Error::InvalidPeer(
+                "Peer version does not match expected version.".to_string(),
+            ));
+        }
 
         tracing::info!("Handshake complete!");
 
         // we can now save these keys as the new session keys for the connection
         self.inner_key = Some(inner_key.clone());
         self.outer_key = Some(outer_key.clone());
+        self.inner_key_salt = Some(inner_key_salt.clone());
+        self.outer_key_salt = Some(outer_key_salt.clone());
 
         // finally, we need to create a new channel for sending messages
         let (tx, rx) = unbounded::<TokioMessage>();
@@ -288,16 +702,35 @@ impl Connection {
         };
 
         // we have now connected :-)
-        {
-            let mut state = self.state.lock().await;
-            *state = ConnectionState::Connected;
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.set_connected()?;
+            }
+            Err(e) => {
+                tracing::warn!("Error setting connection state to connected: {:?}", e);
+                return Err(Error::BusyLine(
+                    "Error setting connection state to connected.".to_string(),
+                ));
+            }
         }
 
         // and now we can start the message handling loop - make sure to
         // handle the sending of messages to others
         let received_from_peer = incoming.try_for_each(|msg| {
+            if msg.is_empty() {
+                // this may happen, e.g. if the connection is closed
+                // This can be safely ignored
+                return future::ok(());
+            }
+
             // we need to deenvelope the message
-            let msg: String = match deenvelope_message(msg, &inner_key, &outer_key) {
+            let msg: String = match deenvelope_message(
+                msg,
+                &inner_key,
+                &outer_key,
+                &inner_key_salt,
+                &outer_key_salt,
+            ) {
                 Ok(msg) => msg,
                 Err(e) => {
                     tracing::warn!("Error de-enveloping message: {:?}", e);
@@ -305,9 +738,20 @@ impl Connection {
                 }
             };
 
-            exchange::received(Message::new(&peer_name, &msg)).unwrap_or_else(|e| {
-                tracing::warn!("Error handling message: {:?}", e);
-            });
+            exchange::received(Message::received_from(&peer_name, &peer_zone, &msg))
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Error handling message: {:?}", e);
+                });
+
+            // record the last time we successfully received a message
+            match self.state.lock() {
+                Ok(mut state) => {
+                    state.register_activity();
+                }
+                Err(e) => {
+                    tracing::warn!("Error registering activity: {:?}", e);
+                }
+            }
 
             future::ok(())
         });
@@ -318,15 +762,39 @@ impl Connection {
         let send_to_peer = rx.map(Ok).forward(outgoing);
 
         // now tell ourselves who has connected
-        exchange::received(Command::connected(peer_name.clone()).into())
-            .with_context(|| "Error triggering /connected control message")?;
+        match exchange::received(
+            Command::connected(
+                &peer_name,
+                &peer_zone,
+                &handshake.engine,
+                &handshake.version,
+            )
+            .into(),
+        ) {
+            Ok(_) => (),
+            Err(e) => {
+                tracing::warn!("Error triggering /connected control message: {:?}", e);
+                self.set_error().await;
+                return Err(Error::Any(e.into()));
+            }
+        }
+
+        // now tell ourselves that we have received a watchdog message
+        // from this peer - this will start a periodic watchdog check
+        exchange::received(Command::watchdog(&peer_name, &peer_zone).into())
+            .with_context(|| "Error triggering /watchdog control message")?;
 
         // finally, send a keepalive message to the peer - this will start
         // a ping-pong with the peer that should keep it open
         // (client sends, as the server should already be set up now)
-        exchange::send(Message::keepalive(&peer_name))
-            .await
-            .with_context(|| "Error sending keepalive message to peer")?;
+        match exchange::send(Message::keepalive(&peer_name, &peer_zone)).await {
+            Ok(_) => (),
+            Err(e) => {
+                tracing::warn!("Error sending keepalive message: {:?}", e);
+                self.set_error().await;
+                return Err(Error::Any(e.into()));
+            }
+        }
 
         pin_mut!(received_from_peer, send_to_peer);
         future::select(received_from_peer, send_to_peer).await;
@@ -353,16 +821,16 @@ impl Connection {
         }
 
         // check we aren't handling another connection
-        {
-            let mut state = self.state.lock().await;
-            if *state != ConnectionState::None {
-                tracing::warn!("Already handling a connection - closing new connection.");
-                return Err(Error::BusyLine(format!(
-                    "Already handling a connection {:?} - closing new connection.",
-                    state
-                )));
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.set_connecting()?;
             }
-            *state = ConnectionState::Connecting;
+            Err(e) => {
+                tracing::warn!("Error setting connection state to connecting: {:?}", e);
+                return Err(Error::BusyLine(
+                    "Error setting connection state to connecting.".to_string(),
+                ));
+            }
         }
 
         // we now know we are the only ones handling the connection,
@@ -375,6 +843,9 @@ impl Connection {
 
         let proxy_header = self.config.proxy_header();
         let mut proxy_client = None;
+
+        let mut inner_key_salt: String = String::new();
+        let mut outer_key_salt: String = String::new();
 
         let process_headers = |request: &HandshakeRequest,
                                response: HandshakeResponse|
@@ -389,6 +860,20 @@ impl Connection {
                 }
             }
 
+            inner_key_salt = request
+                .headers()
+                .get("openportal-inner-salt")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
+            outer_key_salt = request
+                .headers()
+                .get("openportal-outer-salt")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
             Ok(response)
         };
 
@@ -400,6 +885,14 @@ impl Connection {
                     client_ip
                 )
             })?;
+
+        let inner_key_salt: Salt = inner_key_salt
+            .parse()
+            .with_context(|| "Error parsing inner key salt")?;
+
+        let outer_key_salt: Salt = outer_key_salt
+            .parse()
+            .with_context(|| "Error parsing outer key salt")?;
 
         if let Some(proxy_client) = proxy_client {
             tracing::info!("Proxy client: {:?}", proxy_client);
@@ -459,15 +952,17 @@ impl Connection {
                 // but then we would lose tracing messages - these are very helpful
                 // to debug issues
 
-                match deenvelope_message::<SecretKey>(
+                match deenvelope_message::<Handshake>(
                     message.clone(),
                     &client.inner_key(),
                     &client.outer_key(),
+                    &inner_key_salt.xor(client.outer_key().expose_secret()),
+                    &outer_key_salt.xor(client.inner_key().expose_secret()),
                 ) {
                     Ok(_) => {
                         tracing::info!(
                             "Client {:?} authenticated for address: {}",
-                            client.name().unwrap_or_default(),
+                            client.name(),
                             client_ip
                         );
                         true
@@ -499,7 +994,8 @@ impl Connection {
 
         let peer = clients[0].clone();
 
-        let peer_name = peer.name().unwrap_or_default();
+        let peer_name = peer.name();
+        let peer_zone = peer.zone();
 
         if peer_name.is_empty() {
             tracing::warn!("Peer must have a name to handle a connection.");
@@ -514,23 +1010,119 @@ impl Connection {
             peer_name
         );
 
+        // we have found the right client to xor the salts
+        let inner_key_salt = inner_key_salt.xor(peer.outer_key().expose_secret());
+        let outer_key_salt = outer_key_salt.xor(peer.inner_key().expose_secret());
+
         // the peer has sent us the new session outer key that should be used,
         // wrapped in the client/server inner and outer keys
-        let outer_key =
-            deenvelope_message::<SecretKey>(message, &peer.inner_key(), &peer.outer_key())
-                .with_context(|| "Error de-enveloping message - closing connection.")?;
+        let handshake = deenvelope_message::<Handshake>(
+            message,
+            &peer.inner_key(),
+            &peer.outer_key(),
+            &inner_key_salt,
+            &outer_key_salt,
+        )
+        .with_context(|| "Error de-enveloping message - closing connection.")?;
+
+        let outer_key = handshake.session_key.clone();
+
+        let peer_engine = handshake.engine;
+        let peer_version = handshake.version;
 
         // we will create a new session inner key and send it back to the
         // client, wrapped in the client/server inner key and session outer key
         let inner_key = Key::generate();
 
-        let response = envelope_message(inner_key.clone(), &peer.inner_key(), &outer_key)
-            .with_context(|| "Error enveloping message - closing connection.")?;
+        let handshake = Handshake {
+            session_key: inner_key.clone(),
+            engine: env!("CARGO_PKG_NAME").to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+
+        let response = envelope_message(
+            handshake,
+            &peer.inner_key(),
+            &outer_key,
+            &inner_key_salt,
+            &outer_key_salt,
+        )
+        .with_context(|| "Error enveloping message - closing connection.")?;
 
         outgoing
             .send(response)
             .await
             .with_context(|| "Error sending response to peer")?;
+
+        // the peer will now send us its PeerDetails
+        let message = incoming.next().await.ok_or_else(|| {
+            tracing::warn!("No peer information received - closing connection.");
+            Error::InvalidPeer("No peer information received - closing connection.".to_string())
+        })??;
+
+        let peer_details = deenvelope_message::<PeerDetails>(
+            message,
+            &inner_key,
+            &outer_key,
+            &inner_key_salt,
+            &outer_key_salt,
+        )
+        .with_context(|| "Error de-enveloping message - closing connection.")?;
+
+        tracing::info!(
+            "Connected to peer {}, using engine {}, version {}",
+            peer_details,
+            peer_engine,
+            peer_version
+        );
+
+        if peer_details.name() != peer_name {
+            tracing::warn!(
+                "Peer name does not match expected name: {} != {}",
+                peer_details.name(),
+                peer_name
+            );
+            return Err(Error::InvalidPeer(
+                "Peer name does not match expected name - closing connection.".to_string(),
+            ));
+        }
+
+        if peer_details.zone() != peer_zone {
+            tracing::warn!(
+                "Peer zone does not match expected zone: {} != {}",
+                peer_details.zone(),
+                peer.zone()
+            );
+            return Err(Error::InvalidPeer(
+                "Peer zone does not match expected zone - closing connection.".to_string(),
+            ));
+        }
+
+        if peer_details.version() != 1 {
+            tracing::warn!(
+                "Peer version does not match expected version: {} != 1",
+                peer_details.version()
+            );
+            return Err(Error::InvalidPeer(
+                "Peer version does not match expected version - closing connection.".to_string(),
+            ));
+        }
+
+        // now send back our PeerDetials
+        let peer_details = PeerDetails::new(&service_name, &peer_zone);
+
+        let message = envelope_message(
+            peer_details,
+            &inner_key,
+            &outer_key,
+            &inner_key_salt,
+            &outer_key_salt,
+        )?;
+
+        outgoing
+            .send(message)
+            .await
+            .with_context(|| "Error sending response to peer - closing connection")?;
 
         tracing::info!("Handshake complete!");
 
@@ -541,23 +1133,43 @@ impl Connection {
         self.tx = Some(Arc::new(TokioMutex::new(tx)));
         self.inner_key = Some(inner_key.clone());
         self.outer_key = Some(outer_key.clone());
+        self.inner_key_salt = Some(inner_key_salt.clone());
+        self.outer_key_salt = Some(outer_key_salt.clone());
         self.peer = Some(peer.to_peer().clone());
-        {
-            let mut state = self.state.lock().await;
-            *state = ConnectionState::Connected;
+
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.set_connected()?;
+            }
+            Err(e) => {
+                tracing::warn!("Error setting connection state to connected: {:?}", e);
+                return Err(Error::BusyLine(
+                    "Error setting connection state to connected.".to_string(),
+                ));
+            }
         }
 
         // we've now completed the handshake and can use the two session
         // keys to trust and secure both ends of the connection - we can
         // register this connection - must unregister when we close
-        exchange::register(self.clone())
-            .await
-            .with_context(|| "Error registering connection with exchange")?;
+        match exchange::register(self.clone()).await {
+            Ok(_) => (),
+            Err(e) => {
+                tracing::warn!("Error registering connection with exchange: {:?}", e);
+                return Err(Error::Any(e.into()));
+            }
+        }
 
         // handle the sending of messages to others
         let received_from_peer = incoming.try_for_each(|msg| {
             // we need to deenvelope the message
-            let msg: String = match deenvelope_message(msg, &inner_key, &outer_key) {
+            let msg: String = match deenvelope_message(
+                msg,
+                &inner_key,
+                &outer_key,
+                &inner_key_salt,
+                &outer_key_salt,
+            ) {
                 Ok(msg) => msg,
                 Err(e) => {
                     tracing::warn!("Error de-enveloping message: {:?}", e);
@@ -565,9 +1177,10 @@ impl Connection {
                 }
             };
 
-            exchange::received(Message::new(&peer_name, &msg)).unwrap_or_else(|e| {
-                tracing::warn!("Error handling message: {:?}", e);
-            });
+            exchange::received(Message::received_from(&peer_name, &peer_zone, &msg))
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Error handling message: {:?}", e);
+                });
 
             future::ok(())
         });
@@ -578,8 +1191,15 @@ impl Connection {
         let send_to_peer = rx.map(Ok).forward(outgoing);
 
         // now tell ourselves who has connected
-        exchange::received(Command::connected(peer_name.clone()).into())
-            .with_context(|| "Error triggering /connected control message")?;
+        exchange::received(
+            Command::connected(&peer_name, &peer_zone, &peer_engine, &peer_version).into(),
+        )
+        .with_context(|| "Error triggering /connected control message")?;
+
+        // now tell ourselves that we have received a watchdog message
+        // from this peer - this will start a periodic watchdog check
+        exchange::received(Command::watchdog(&peer_name, &peer_zone).into())
+            .with_context(|| "Error triggering /watchdog control message")?;
 
         pin_mut!(received_from_peer, send_to_peer);
         future::select(received_from_peer, send_to_peer).await;
@@ -601,17 +1221,34 @@ mod tests {
     fn test_enveloping() {
         let inner_key = Key::generate();
         let outer_key = Key::generate();
+        #[allow(clippy::unwrap_used)]
+        let inner_key_salt = Salt::generate().unwrap();
+        #[allow(clippy::unwrap_used)]
+        let outer_key_salt = Salt::generate().unwrap();
 
         let message = "Hello, world!";
 
-        let envelope = envelope_message(message, &inner_key, &outer_key).unwrap_or_else(|e| {
+        let envelope = envelope_message(
+            message,
+            &inner_key,
+            &outer_key,
+            &inner_key_salt,
+            &outer_key_salt,
+        )
+        .unwrap_or_else(|e| {
             unreachable!("Error enveloping message: {:?}", e);
         });
 
-        let deenvelope = deenvelope_message::<String>(envelope, &inner_key, &outer_key)
-            .unwrap_or_else(|e| {
-                unreachable!("Error de-enveloping message: {:?}", e);
-            });
+        let deenvelope = deenvelope_message::<String>(
+            envelope,
+            &inner_key,
+            &outer_key,
+            &inner_key_salt,
+            &outer_key_salt,
+        )
+        .unwrap_or_else(|e| {
+            unreachable!("Error de-enveloping message: {:?}", e);
+        });
 
         assert_eq!(message, deenvelope);
     }

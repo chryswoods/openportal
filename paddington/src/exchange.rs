@@ -3,12 +3,15 @@
 
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::RwLock;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 
+use crate::command::Command;
 use crate::connection::Connection;
 use crate::error::Error;
 use crate::message::Message;
@@ -64,6 +67,10 @@ pub struct Exchange {
     tx: UnboundedSender<Message>,
     // handler holds object that implements the MessageHandler trait
     handler: Option<AsyncMessageHandler>,
+
+    // active watchdog checks - ensures that we don't flood the exchange
+    // if a connection flaps
+    watchdogs: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Default for Exchange {
@@ -126,6 +133,7 @@ impl Exchange {
             connections: HashMap::new(),
             tx,
             handler: None,
+            watchdogs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -156,12 +164,28 @@ pub async fn set_handler(handler: AsyncMessageHandler) -> Result<(), Error> {
     Ok(())
 }
 
+fn get_recipient(message: &Message) -> String {
+    format!("{}@{}", message.recipient(), message.zone())
+}
+
+fn get_key(connection: &Connection) -> String {
+    format!("{}@{}", connection.name(), connection.zone())
+}
+
 pub async fn unregister(connection: &Connection) -> Result<(), Error> {
-    let name = connection.name().unwrap_or_default();
+    let name = connection.name();
 
     if name.is_empty() {
         return Err(Error::UnnamedConnection(
             "Connection must have a name".to_string(),
+        ));
+    }
+
+    let zone = connection.zone();
+
+    if zone.is_empty() {
+        return Err(Error::UnnamedConnection(
+            "Connection must have a zone".to_string(),
         ));
     }
 
@@ -172,25 +196,28 @@ pub async fn unregister(connection: &Connection) -> Result<(), Error> {
         }
     };
 
-    let key = name.clone();
+    let key = get_key(connection);
 
     if exchange.connections.contains_key(&key) {
         exchange.connections.remove(&key);
-        Ok(())
-    } else {
-        Err(Error::UnnamedConnection(format!(
-            "Connection {} not found",
-            name
-        )))
     }
+
+    Ok(())
 }
 
 pub async fn register(connection: Connection) -> Result<(), Error> {
-    let name = connection.name().unwrap_or_default();
+    let name = connection.name();
+    let zone = connection.zone();
 
     if name.is_empty() {
         return Err(Error::UnnamedConnection(
             "Connection must have a name".to_string(),
+        ));
+    }
+
+    if zone.is_empty() {
+        return Err(Error::UnnamedConnection(
+            "Connection must have a zone".to_string(),
         ));
     }
 
@@ -201,12 +228,12 @@ pub async fn register(connection: Connection) -> Result<(), Error> {
         }
     };
 
-    let key = name.clone();
+    let key = get_key(&connection);
 
     if exchange.connections.contains_key(&key) {
-        return Err(Error::UnnamedConnection(format!(
+        return Err(Error::InvalidPeer(format!(
             "Connection {} already exists",
-            name
+            key
         )));
     }
 
@@ -222,7 +249,7 @@ pub async fn send(message: Message) -> Result<(), Error> {
         }
     }
     .connections
-    .get(message.sender())
+    .get(&get_recipient(&message))
     .cloned();
 
     if let Some(connection) = connection {
@@ -231,7 +258,7 @@ pub async fn send(message: Message) -> Result<(), Error> {
     } else {
         Err(Error::UnnamedConnection(format!(
             "Connection {} not found",
-            message.sender()
+            message.recipient()
         )))
     }
 }
@@ -248,4 +275,113 @@ pub fn received(message: Message) -> Result<(), Error> {
         tracing::error!("Error sending message: {}", e);
         Error::Send(format!("Error sending message: {}", e))
     })
+}
+
+pub async fn watchdog(peer: &str, zone: &str) -> Result<(), Error> {
+    let name = format!("{}@{}", peer, zone);
+
+    let connection = match SINGLETON_EXCHANGE.read() {
+        Ok(exchange) => exchange,
+        Err(e) => {
+            return Err(Error::Poison(format!("Error getting read lock: {}", e)));
+        }
+    }
+    .connections
+    .get(&name)
+    .cloned();
+
+    if let Some(mut connection) = connection {
+        tracing::debug!("Sending watchdog to {}", name);
+        connection.watchdog().await?;
+        tracing::debug!("Sent watchdog to {}", name);
+
+        // make sure we are the only watchdog for this connection
+        let watchdogs = match SINGLETON_EXCHANGE.read() {
+            Ok(exchange) => exchange.watchdogs.clone(),
+            Err(e) => {
+                tracing::error!("Error getting read lock: {}", e);
+                return Err(Error::Poison(format!("Error getting read lock: {}", e)));
+            }
+        };
+
+        tracing::debug!("Checking watchdogs for {}", name);
+
+        match watchdogs.lock() {
+            Ok(mut watchdogs) => {
+                if watchdogs.contains(&name) {
+                    tracing::warn!("Watchdog already active for {} - skipping", name);
+                    return Ok(());
+                }
+
+                watchdogs.insert(name.clone());
+            }
+            Err(e) => {
+                return Err(Error::Poison(format!("Error getting lock: {}", e)));
+            }
+        };
+
+        // wait 27 seconds and then send the watchdog message again
+        tracing::debug!("Waiting for 27 seconds before sending watchdog again");
+        tokio::time::sleep(tokio::time::Duration::from_secs(27)).await;
+        tracing::debug!("Checking watchdogs for {} again...", name);
+
+        // remove the entry for this connection - other's should be able to send
+        match watchdogs.lock() {
+            Ok(mut watchdogs) => {
+                tracing::debug!("Removing watchdog for {}", name);
+                watchdogs.remove(&name);
+            }
+            Err(e) => {
+                tracing::error!("Error getting lock: {}", e);
+                return Err(Error::Poison(format!("Error getting lock: {}", e)));
+            }
+        }
+
+        tracing::debug!("Sending watchdog to {} again", name);
+        match received(Command::watchdog(peer, zone).into()) {
+            Ok(_) => {
+                tracing::debug!("Sent watchdog to {} again", name);
+            }
+            Err(e) => {
+                tracing::error!("Error sending watchdog message to {}: {}", name, e);
+                match connection.disconnect().await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Error disconnecting {}: {}", name, e);
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("End of watchdog for {}", name);
+
+        Ok(())
+    } else {
+        Err(Error::UnnamedConnection(format!(
+            "Connection {}@{} not found",
+            peer, zone
+        )))
+    }
+}
+
+pub async fn disconnect(peer: &str, zone: &str) -> Result<(), Error> {
+    let connection = match SINGLETON_EXCHANGE.read() {
+        Ok(exchange) => exchange,
+        Err(e) => {
+            return Err(Error::Poison(format!("Error getting read lock: {}", e)));
+        }
+    }
+    .connections
+    .get(&format!("{}@{}", peer, zone))
+    .cloned();
+
+    if let Some(mut connection) = connection {
+        connection.disconnect().await?;
+        Ok(())
+    } else {
+        Err(Error::UnnamedConnection(format!(
+            "Connection {} not found",
+            peer
+        )))
+    }
 }

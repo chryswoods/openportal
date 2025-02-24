@@ -25,6 +25,9 @@ pub enum Error {
     UrlParse(#[from] url::ParseError),
 
     #[error("{0}")]
+    Bug(String),
+
+    #[error("{0}")]
     Call(String),
 
     #[error("{0}")]
@@ -46,10 +49,19 @@ pub enum Error {
     InvalidInstruction(String),
 
     #[error("{0}")]
+    InvalidPeer(String),
+
+    #[error("{0}")]
     InvalidState(String),
 
     #[error("{0}")]
-    LockError(String),
+    Duplicate(String),
+
+    #[error("{0}")]
+    Expired(String),
+
+    #[error("{0}")]
+    Locked(String),
 
     #[error("{0}")]
     Login(String),
@@ -61,7 +73,16 @@ pub enum Error {
     MissingAgent(String),
 
     #[error("{0}")]
+    MissingProject(String),
+
+    #[error("{0}")]
+    MissingUser(String),
+
+    #[error("{0}")]
     NoPortal(String),
+
+    #[error("{0}")]
+    InvalidPortal(String),
 
     #[error("{0}")]
     NotFound(String),
@@ -86,6 +107,9 @@ pub enum Error {
 
     #[error("{0}")]
     UnmanagedUser(String),
+
+    #[error("{0}")]
+    UnmanagedGroup(String),
 }
 
 // implement into a paddington::Error

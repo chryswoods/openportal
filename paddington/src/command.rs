@@ -6,18 +6,58 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Command {
-    Error { error: String },
-    Connected { agent: String },
-    Disconnected { agent: String },
+    Error {
+        error: String,
+    },
+    Connected {
+        agent: String,
+        zone: String,
+        engine: String,
+        version: String,
+    },
+    Watchdog {
+        agent: String,
+        zone: String,
+    },
+    Disconnect {
+        agent: String,
+        zone: String,
+    },
+    Disconnected {
+        agent: String,
+        zone: String,
+    },
 }
 
 impl Command {
-    pub fn connected(agent: String) -> Self {
-        Self::Connected { agent }
+    pub fn connected(agent: &str, zone: &str, engine: &str, version: &str) -> Self {
+        Self::Connected {
+            agent: agent.to_owned(),
+            zone: zone.to_owned(),
+            engine: engine.to_owned(),
+            version: version.to_owned(),
+        }
     }
 
-    pub fn disconnected(agent: String) -> Self {
-        Self::Disconnected { agent }
+    pub fn disconnect(agent: &str, zone: &str) -> Self {
+        Self::Disconnect {
+            agent: agent.to_owned(),
+            zone: zone.to_owned(),
+        }
+    }
+
+    pub fn disconnected(agent: &str, zone: &str) -> Self {
+        Self::Disconnected {
+            agent: agent.to_owned(),
+            zone: zone.to_owned(),
+        }
+    }
+
+    pub fn watchdog(agent: &str, zone: &str) -> Self {
+        Self::Watchdog {
+            agent: agent.to_owned(),
+            zone: zone.to_owned(),
+        }
     }
 
     pub fn error(error: String) -> Self {

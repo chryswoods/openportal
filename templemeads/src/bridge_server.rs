@@ -20,6 +20,7 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::IpAddr;
+use std::path;
 use tokio::net::TcpListener;
 use url::Url;
 use uuid::Uuid;
@@ -158,6 +159,46 @@ impl Invite {
     }
 }
 
+#[allow(dead_code)]
+pub fn load(invite_file: &path::PathBuf) -> Result<Invite, Error> {
+    // read the invite file
+    let invite = std::fs::read_to_string(invite_file)
+        .with_context(|| format!("Could not read invite file: {:?}", invite_file))?;
+
+    // parse the invite file
+    let invite: Invite = toml::from_str(&invite)
+        .with_context(|| format!("Could not parse invite file from toml: {:?}", invite_file))?;
+
+    Ok(invite)
+}
+
+pub fn save(invite: &Invite, invite_file: &path::PathBuf) -> Result<(), Error> {
+    // serialise to toml
+    let invite_toml =
+        toml::to_string(invite).with_context(|| "Could not serialise invite to toml")?;
+
+    let invite_file_string = invite_file.to_string_lossy();
+
+    let prefix = invite_file.parent().with_context(|| {
+        format!(
+            "Could not get parent directory for invite file: {:?}",
+            invite_file_string
+        )
+    })?;
+
+    std::fs::create_dir_all(prefix).with_context(|| {
+        format!(
+            "Could not create parent directory for invite file: {:?}",
+            invite_file_string
+        )
+    })?;
+
+    std::fs::write(invite_file, invite_toml)
+        .with_context(|| format!("Could not write invite file: {:?}", invite_file))?;
+
+    Ok(())
+}
+
 ///
 /// Verify the headers for the request - this checks the API key
 ///
@@ -261,7 +302,7 @@ async fn health(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     verify_headers(&state, &headers, "get", "health", None)?;
-    tracing::info!("Health check");
+    tracing::debug!("Health check");
     Ok(Json(json!({"status": "ok"})))
 }
 
@@ -331,7 +372,7 @@ async fn status(
         Some(serde_json::json!({"job": payload.job})),
     )?;
 
-    tracing::info!("Status request for job: {:?}", payload);
+    tracing::debug!("Status request for job: {:?}", payload);
 
     match bridge_status(&payload.job).await {
         Ok(job) => Ok(Json(job)),
@@ -341,8 +382,6 @@ async fn status(
         }
     }
 }
-
-/// Functions for the Bridge server
 
 ///
 /// Function spawned to run the API server in a background thread

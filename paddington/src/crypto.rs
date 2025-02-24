@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::Context;
-use orion::{aead, auth, kdf};
-use secrecy::{CloneableSecret, DebugSecret, Secret, SerializableSecret, Zeroize};
+use orion::{aead, auth, hazardous::kdf::hkdf, kdf};
+use secrecy::{zeroize::Zeroize, CloneableSecret, SecretBox, SerializableSecret};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_with::serde_as;
 use std::fmt::Display;
 use std::{fmt, str, vec};
 
 use crate::error::Error;
+
+pub const KEY_SIZE: usize = 32;
+pub const SALT_SIZE: usize = KEY_SIZE;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Signature {
@@ -55,11 +58,59 @@ impl Signature {
     }
 }
 
+pub fn random_bytes(size: usize) -> Result<Vec<u8>, Error> {
+    let mut data: Vec<u8> = vec![0; size];
+    orion::util::secure_rand_bytes(&mut data).context("Failed to generate random bytes.")?;
+    Ok(data)
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Salt {
+    #[serde_as(as = "serde_with::hex::Hex")]
+    data: vec::Vec<u8>,
+}
+
+impl Display for Salt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(&self.data))
+    }
+}
+
+impl Salt {
+    pub fn generate() -> Result<Salt, Error> {
+        let mut data: Vec<u8> = [0u8; SALT_SIZE].to_vec();
+        orion::util::secure_rand_bytes(&mut data).context("Failed to generate a salt.")?;
+
+        Ok(Salt { data })
+    }
+
+    pub fn xor(self: &Salt, key: &Key) -> Salt {
+        let data: Vec<u8> = self
+            .data
+            .iter()
+            .zip(key.data.iter())
+            .map(|(&x1, &x2)| x1 ^ x2)
+            .collect();
+
+        Salt { data }
+    }
+}
+
+impl std::str::FromStr for Salt {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = hex::decode(s).with_context(|| "Failed to decode the salt.")?;
+        Ok(Salt { data: bytes })
+    }
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Key {
     #[serde_as(as = "serde_with::hex::Hex")]
-    pub data: vec::Vec<u8>,
+    data: vec::Vec<u8>,
 }
 
 impl Zeroize for Key {
@@ -70,10 +121,9 @@ impl Zeroize for Key {
 
 /// Permits cloning, Debug printing as [[REDACTED]] and serialising
 impl CloneableSecret for Key {}
-impl DebugSecret for Key {}
 impl SerializableSecret for Key {}
 
-pub type SecretKey = Secret<Key>;
+pub type SecretKey = SecretBox<Key>;
 
 impl Key {
     ///
@@ -92,10 +142,27 @@ impl Key {
     /// let key = Key::generate();
     /// ```
     pub fn generate() -> SecretKey {
-        Key {
+        Box::new(Key {
             data: aead::SecretKey::default().unprotected_as_bytes().to_vec(),
-        }
+        })
         .into()
+    }
+
+    ///
+    /// Derive a new secret key from this key, the passed salt, and
+    /// the (optional) additional information
+    ///
+    pub fn derive(
+        self: &Key,
+        salt: &Salt,
+        additional_info: Option<&[u8]>,
+    ) -> Result<SecretKey, Error> {
+        let mut new_key = self.data.clone();
+
+        hkdf::sha512::derive_key(&salt.data, &self.data, additional_info, &mut new_key)
+            .context("Failed to derive key.")?;
+
+        Ok(Box::new(Key { data: new_key }).into())
     }
 
     ///
@@ -131,19 +198,19 @@ impl Key {
         let salt =
             kdf::Salt::from_slice(&salt).context("Failed to create a salt from the salt data.")?;
 
-        Ok(Key {
+        Ok(Box::new(Key {
             data: kdf::derive_key(
                 &kdf::Password::from_slice(password.as_bytes())
                     .context(format!("Failed to generate a password from {}", password))?,
                 &salt,
                 3,
                 8,
-                32,
+                KEY_SIZE as u32,
             )
             .context("Failed to derive key from password.")?
             .unprotected_as_bytes()
             .to_vec(),
-        }
+        })
         .into())
     }
 
@@ -151,7 +218,17 @@ impl Key {
     /// Create and return a null key - this should not be used
     ///
     pub fn null() -> SecretKey {
-        Key { data: vec![0; 32] }.into()
+        Box::new(Key {
+            data: vec![0; KEY_SIZE],
+        })
+        .into()
+    }
+
+    ///
+    /// Return whether or not this key is null
+    ///
+    pub fn is_null(&self) -> bool {
+        self.data.is_empty() || self.data.iter().all(|&x| x == 0)
     }
 
     ///
@@ -333,16 +410,16 @@ mod tests {
     #[test]
     fn test_key_generate() {
         let key = Key::generate();
-        assert_eq!(key.expose_secret().data.len(), 32);
+        assert_eq!(key.expose_secret().data.len(), KEY_SIZE);
     }
 
     #[test]
     fn test_key_from_password() {
-        let key: Secret<Key> = Key::from_password("password").unwrap_or_else(|err| {
+        let key: SecretBox<Key> = Key::from_password("password").unwrap_or_else(|err| {
             unreachable!("Failed to create key from password: {}", err);
         });
 
-        assert_eq!(key.expose_secret().data.len(), 32);
+        assert_eq!(key.expose_secret().data.len(), KEY_SIZE);
 
         let key2: SecretKey = Key::from_password("password").unwrap_or_else(|err| {
             unreachable!("Failed to create key from password: {}", err);
@@ -353,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_key_encrypt_decrypt() {
-        let key: Secret<Key> = Key::generate();
+        let key: SecretBox<Key> = Key::generate();
 
         let encrypted_data: String = key
             .expose_secret()
@@ -374,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_key_sign_verify() {
-        let key: Secret<Key> = Key::generate();
+        let key: SecretBox<Key> = Key::generate();
 
         let signature: Signature = key
             .expose_secret()
