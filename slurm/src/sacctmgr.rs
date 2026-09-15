@@ -16,8 +16,8 @@ use tokio::sync::Mutex;
 
 use crate::cache;
 use crate::slurm::{
-    clean_account_name, clean_user_name, get_managed_organization, SlurmAccount, SlurmLimit,
-    SlurmUser,
+    clean_account_name, clean_user_name, get_managed_organization, RequeuePolicy, SlurmAccount,
+    SlurmLimit, SlurmUser,
 };
 use crate::slurm::{SlurmJob, SlurmNodes};
 
@@ -1039,6 +1039,9 @@ pub struct ReportTotals {
     requeue_usage: u64,
     requeue_events: u64,
     requeue_wait_seconds: u64,
+    charged_requeue_usage: u64,
+    charged_requeue_events: u64,
+    charged_requeue_wait_seconds: u64,
     /// Set when a record counted as a job in this window had not finished when
     /// we asked, so its runtime is not yet final. Such a window must not be
     /// frozen - see `record_job`.
@@ -1063,6 +1066,13 @@ impl ReportTotals {
 /// always reported. Keeping the two apart is the whole point of requeue
 /// accounting - see `docs/plans/slurm-requeue-accounting-design.md`.
 ///
+/// `policy` then decides which of the superseded attempts are charged anyway.
+/// A charged attempt is accumulated into the main figures with every other job,
+/// exactly as though it had never been requeued, *and* recorded again in the
+/// charged-requeue maps so that it can still be seen - those maps describe
+/// usage that is already in the total, and are never added to it. See
+/// `docs/plans/slurm-requeue-charging-design.md`.
+///
 /// Usage is accumulated for every record overlapping the window, since the
 /// record has already been clipped to it. Job and event *counts*, and the wait
 /// times that go with them, are accumulated only for records that started
@@ -1073,6 +1083,7 @@ pub fn record_job(
     report: &mut DailyProjectUsageReport,
     job: &SlurmJob,
     window_start: &chrono::DateTime<Utc>,
+    policy: RequeuePolicy,
     totals: &mut ReportTotals,
 ) {
     let usage = job.billed_node_seconds();
@@ -1082,6 +1093,75 @@ pub fn record_job(
     // window, so counting a *job* needs this guard or a long job is counted
     // once per window it touches.
     let started_in_window = job.original_start_time() >= window_start;
+
+    if job.is_requeued_attempt() && policy.charges(job.terminal_state()) {
+        // Charged: the attempt counts as usage like any other, and is recorded
+        // in the charged maps alongside rather than instead - those describe a
+        // subset of what has just been added, never an addition to it.
+        let state = job.terminal_state();
+
+        report.add_charged_requeue_usage(job.user(), Usage::new(usage));
+        report.add_charged_requeue_state_usage(state, Usage::new(usage));
+        totals.charged_requeue_usage = totals.charged_requeue_usage.saturating_add(usage);
+
+        report.add_charged_requeue_component_usage(
+            "cpu",
+            job.user(),
+            Usage::new(job.cpu_seconds()),
+        );
+        report.add_charged_requeue_component_usage(
+            "memory",
+            job.user(),
+            Usage::new(job.memory_seconds()),
+        );
+        report.add_charged_requeue_component_usage(
+            "gpu",
+            job.user(),
+            Usage::new(job.gpu_seconds()),
+        );
+        report.add_charged_requeue_component_usage(
+            "billing",
+            job.user(),
+            Usage::new(job.billing_seconds()),
+        );
+
+        // Counted with no window guard, for the reason set out at length on the
+        // absorbed events below: a superseded attempt is classified `Requeued`
+        // in exactly one window, the one holding the requeue itself.
+        report.add_charged_requeue_events(job.user(), state, 1);
+        report.add_charged_requeue_wait_seconds(job.user(), wait_seconds);
+        totals.charged_requeue_events = totals.charged_requeue_events.saturating_add(1);
+        totals.charged_requeue_wait_seconds = totals
+            .charged_requeue_wait_seconds
+            .saturating_add(wait_seconds);
+
+        // A charged attempt held the reservation's nodes exactly as an absorbed
+        // one did, and `reservation_requeue_usage` is the record of what a
+        // reservation's occupancy owed to requeues. It is not a charging
+        // figure, so both kinds belong in it.
+        if job.is_reserved() {
+            report.add_reservation_requeue_usage(job.reservation(), job.user(), Usage::new(usage));
+        }
+
+        // ...and then falls through to the usage accumulation below, which is
+        // what "charged like any other job" means. What it must *not* pick up
+        // is the job count, the expansion factor or the job size: those are
+        // properties of a job, counted once in the window its base attempt
+        // started in, and a superseded attempt is not a second job.
+        report.add_usage(job.user(), Usage::new(usage));
+        totals.usage = totals.usage.saturating_add(usage);
+
+        report.add_component_usage("cpu", job.user(), Usage::new(job.cpu_seconds()));
+        report.add_component_usage("memory", job.user(), Usage::new(job.memory_seconds()));
+        report.add_component_usage("gpu", job.user(), Usage::new(job.gpu_seconds()));
+        report.add_component_usage("billing", job.user(), Usage::new(job.billing_seconds()));
+
+        if job.is_reserved() {
+            report.add_reservation_usage(job.reservation(), job.user(), Usage::new(usage));
+        }
+
+        return;
+    }
 
     if job.is_requeued_attempt() {
         let state = job.terminal_state();
@@ -1253,6 +1333,7 @@ fn report_node_failures(jobs: &[SlurmJob], project: &ProjectMapping) {
 fn check_counter_consistency(
     report: &DailyProjectUsageReport,
     totals: &ReportTotals,
+    policy: RequeuePolicy,
     project: &ProjectMapping,
     day: &greatwestern::grammar::Date,
 ) -> bool {
@@ -1319,6 +1400,47 @@ fn check_counter_consistency(
             report.requeue_wait_seconds(),
             report.total_requeue_usage().seconds()
         );
+    }
+
+    if report.num_charged_requeue_events() != totals.charged_requeue_events
+        || report.charged_requeue_wait_seconds() != totals.charged_requeue_wait_seconds
+        || report.total_charged_requeue_usage().seconds() != totals.charged_requeue_usage
+    {
+        consistent = false;
+        tracing::warn!(
+            "Charged requeue inconsistency for project {} on {}: \
+             local counters ({} events, {}s wait, {}s usage) differ from report totals \
+             ({} events, {}s wait, {}s usage). This may indicate a bug.",
+            project.project(),
+            day,
+            totals.charged_requeue_events,
+            totals.charged_requeue_wait_seconds,
+            totals.charged_requeue_usage,
+            report.num_charged_requeue_events(),
+            report.charged_requeue_wait_seconds(),
+            report.total_charged_requeue_usage().seconds()
+        );
+    }
+
+    // A state the report charged for that the policy does not charge for means
+    // the two have come apart - a report built under one policy merged with one
+    // built under another, or the split applied somewhere that did not ask.
+    // Checked here rather than in `is_consistent` because the policy is the
+    // agent's, not the report's: a report travels between agents, and the one
+    // reading it may be configured differently from the one that wrote it.
+    for state in report.charged_requeue_states() {
+        if !policy.charges(&state) {
+            consistent = false;
+            tracing::warn!(
+                "Report for project {} on {} charges requeues in state '{}', which the \
+                 policy '{}' in force here does not charge. This may indicate a bug, or \
+                 a report built under a different policy.",
+                project.project(),
+                day,
+                state,
+                policy
+            );
+        }
     }
 
     // the per-state maps must account for every event and every second of
@@ -1458,6 +1580,11 @@ async fn get_hourly_report(
     let mut daily_report = DailyProjectUsageReport::default();
     let mut totals = ReportTotals::default();
 
+    // Read once for the whole day rather than per record: a day built under two
+    // different policies would be internally inconsistent, and nothing else
+    // here would notice.
+    let policy = cache::get_requeue_policy().await;
+
     // Hours that Slurm would not answer for. An hour is a small enough piece
     // that losing one is better than losing the whole run, so a failure here
     // is skipped rather than propagated - but the day it belongs to is then
@@ -1479,7 +1606,13 @@ async fn get_hourly_report(
             let hour_start_time = hour.start_time().and_utc();
 
             for job in &hourly_report {
-                record_job(&mut daily_report, job, &hour_start_time, &mut totals);
+                record_job(
+                    &mut daily_report,
+                    job,
+                    &hour_start_time,
+                    policy,
+                    &mut totals,
+                );
             }
 
             continue;
@@ -1602,7 +1735,7 @@ async fn get_hourly_report(
         report_node_failures(&jobs, project);
 
         for job in &jobs {
-            record_job(&mut daily_report, job, &start_time, &mut totals);
+            record_job(&mut daily_report, job, &start_time, policy, &mut totals);
         }
     }
 
@@ -1629,7 +1762,7 @@ async fn get_hourly_report(
     }
 
     // runtime consistency check: local shadow counters must match the report's scalar totals
-    let counters_agree = check_counter_consistency(&daily_report, &totals, project, day);
+    let counters_agree = check_counter_consistency(&daily_report, &totals, policy, project, day);
 
     complete_and_cache_if_final(
         &mut daily_report,
@@ -1675,6 +1808,7 @@ async fn get_daily_report(
     }
 
     let now = chrono::Utc::now();
+    let policy = cache::get_requeue_policy().await;
     let start_time = day.day().start_time().and_utc();
     let end_time = day.day().end_time().and_utc();
 
@@ -1739,11 +1873,12 @@ async fn get_daily_report(
             report_node_failures(&jobs, project);
 
             for job in &jobs {
-                record_job(&mut daily_report, job, &start_time, &mut totals);
+                record_job(&mut daily_report, job, &start_time, policy, &mut totals);
             }
 
             // runtime consistency check
-            let counters_agree = check_counter_consistency(&daily_report, &totals, project, day);
+            let counters_agree =
+                check_counter_consistency(&daily_report, &totals, policy, project, day);
 
             complete_and_cache_if_final(
                 &mut daily_report,
@@ -2552,15 +2687,28 @@ mod tests {
 
     /// Build a daily report the way `get_hourly_report` and `get_daily_report`
     /// do, over the records `sacct` would return for one window.
+    ///
+    /// Under `NoCharge`, which is the behaviour that existed before there was a
+    /// charging policy: these cases are about the classification machinery, and
+    /// asserting it against the policy that moves none of it keeps them testing
+    /// one thing. `report_for_policy` is for the cases that are about the
+    /// policy itself.
     fn report_for(
         window: (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
+    ) -> (DailyProjectUsageReport, ReportTotals) {
+        report_for_policy(window, RequeuePolicy::NoCharge)
+    }
+
+    fn report_for_policy(
+        window: (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
+        policy: RequeuePolicy,
     ) -> (DailyProjectUsageReport, ReportTotals) {
         let (start, _) = window;
         let mut report = DailyProjectUsageReport::default();
         let mut totals = ReportTotals::default();
 
         for job in consumers_for(window) {
-            record_job(&mut report, &job, &start, &mut totals);
+            record_job(&mut report, &job, &start, policy, &mut totals);
         }
 
         (report, totals)
@@ -2614,7 +2762,13 @@ mod tests {
         };
 
         for job in &jobs {
-            record_job(&mut report, job, &start, &mut totals);
+            record_job(
+                &mut report,
+                job,
+                &start,
+                RequeuePolicy::NoCharge,
+                &mut totals,
+            );
         }
 
         (report, totals)
@@ -2795,6 +2949,142 @@ mod tests {
                 .map(|(state, _)| report.requeue_usage_in_state(state))
                 .sum::<Usage>(),
             report.total_requeue_usage()
+        );
+    }
+
+    #[test]
+    fn test_charging_moves_the_user_s_own_requeues_into_the_usage() {
+        // The policy in one assertion: what the site caused stays discarded,
+        // what the user asked for is charged, and the true total is the same
+        // either way - charging moves usage between buckets, it never invents
+        // or loses any.
+        let (absorbed, _) = report_for_policy(day_one(), RequeuePolicy::NoCharge);
+        let (charged, _) = report_for_policy(day_one(), RequeuePolicy::ChargeRequeueStateOnly);
+
+        let requeued_by_user = absorbed.requeue_usage_in_state("REQUEUED");
+        assert!(!requeued_by_user.is_zero(), "the fixture has user requeues");
+
+        assert_eq!(
+            charged.total_usage(),
+            absorbed.total_usage() + requeued_by_user
+        );
+        assert_eq!(
+            charged.total_requeue_usage(),
+            absorbed.total_requeue_usage() - requeued_by_user
+        );
+        assert_eq!(charged.total_charged_requeue_usage(), requeued_by_user);
+
+        assert_eq!(
+            charged.total_usage_including_requeues(),
+            absorbed.total_usage_including_requeues()
+        );
+    }
+
+    #[test]
+    fn test_only_the_bare_requeue_state_is_charged() {
+        // A record that reports both a node failure and a requeue is a node
+        // failure: `terminal_state`'s precedence puts NODE_FAIL first, which is
+        // what makes charging the REQUEUED bucket safe. OTHER - a state a
+        // future Slurm might report - is never charged either.
+        let (report, _) = report_for_policy(day_one(), RequeuePolicy::ChargeRequeueStateOnly);
+
+        assert_eq!(
+            report.charged_requeue_states(),
+            vec!["REQUEUED".to_string()]
+        );
+
+        for state in ["NODE_FAIL", "PREEMPTED", "OTHER"] {
+            assert_eq!(report.charged_requeue_events_in_state(state), 0);
+            assert!(report.charged_requeue_usage_in_state(state).is_zero());
+        }
+
+        // and what was charged is exactly what stopped being absorbed
+        let (absorbed, _) = report_for_policy(day_one(), RequeuePolicy::NoCharge);
+        assert_eq!(
+            report.num_charged_requeue_events(),
+            absorbed.requeue_events_in_state("REQUEUED")
+        );
+        assert_eq!(report.requeue_events_in_state("REQUEUED"), 0);
+    }
+
+    #[test]
+    fn test_a_charged_requeue_is_usage_but_is_not_a_second_job() {
+        // The attempt is charged like any other job, which is about *usage*. A
+        // superseded attempt is not an extra job, did not queue a second time
+        // for the purposes of the mean wait, and must not move the expansion
+        // factor or the mean job size.
+        let (absorbed, _) = report_for_policy(day_one(), RequeuePolicy::NoCharge);
+        let (charged, _) = report_for_policy(day_one(), RequeuePolicy::ChargeRequeueStateOnly);
+
+        assert_eq!(charged.num_jobs(), absorbed.num_jobs());
+        assert_eq!(charged.total_wait_seconds(), absorbed.total_wait_seconds());
+        assert_eq!(
+            charged.total_runtime_seconds(),
+            absorbed.total_runtime_seconds()
+        );
+        assert_eq!(charged.expansion_jobs(), absorbed.expansion_jobs());
+        assert_eq!(
+            charged.total_allocated_cpus(),
+            absorbed.total_allocated_cpus()
+        );
+    }
+
+    #[test]
+    fn test_no_charge_leaves_every_figure_where_it_was() {
+        // The escape hatch has to be exactly the old behaviour, or a site that
+        // sets it is not opting out of anything.
+        let (report, totals) = report_for_policy(day_one(), RequeuePolicy::NoCharge);
+
+        assert!(!report.has_charged_requeues());
+        assert!(report.charged_requeue_states().is_empty());
+        assert_eq!(totals.charged_requeue_events, 0);
+        assert_eq!(totals.charged_requeue_usage, 0);
+        assert_eq!(
+            report.total_usage_including_requeues(),
+            report.total_usage() + report.total_requeue_usage()
+        );
+    }
+
+    #[test]
+    fn test_a_charged_day_agrees_with_its_own_counters() {
+        // The shadow counters are what the agent uses to decide whether a day
+        // may be cached, so the charged ones have to track the report exactly
+        // as the absorbed ones do.
+        let (report, totals) = report_for_policy(day_one(), RequeuePolicy::ChargeRequeueStateOnly);
+
+        assert_eq!(report.total_usage().seconds(), totals.usage);
+        assert_eq!(
+            report.total_charged_requeue_usage().seconds(),
+            totals.charged_requeue_usage
+        );
+        assert_eq!(
+            report.num_charged_requeue_events(),
+            totals.charged_requeue_events
+        );
+        assert_eq!(
+            report.charged_requeue_wait_seconds(),
+            totals.charged_requeue_wait_seconds
+        );
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_the_charged_share_is_of_everything_requeueing_cost() {
+        let (report, _) = report_for_policy(day_one(), RequeuePolicy::ChargeRequeueStateOnly);
+
+        let charged = report.total_charged_requeue_usage().seconds();
+        let all = report.total_requeue_usage_including_charged().seconds();
+
+        assert!(charged > 0 && charged < all, "the fixture has both kinds");
+        assert_eq!(
+            report.charged_requeue_share_per_mille(),
+            Some(charged * 1000 / all)
+        );
+
+        // a day with no requeues at all has no share, which is not zero
+        assert_eq!(
+            DailyProjectUsageReport::default().charged_requeue_share_per_mille(),
+            None
         );
     }
 

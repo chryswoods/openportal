@@ -37,7 +37,7 @@ use greatwestern::grammar::{Date, DateRange, ProjectIdentifier};
 use greatwestern::usagereport::{DailyProjectUsageReport, ProjectUsageReport, Usage};
 
 use op_slurm::sacctmgr::{record_job, runner, set_commands, ReportTotals};
-use op_slurm::slurm::{SlurmJob, SlurmNode, SlurmNodes};
+use op_slurm::slurm::{RequeuePolicy, SlurmJob, SlurmNode, SlurmNodes};
 
 ///
 /// The node this tool is run on, as the agent's `slurm-default-node` option
@@ -74,6 +74,10 @@ struct Options {
     sacct: String,
     cluster: String,
     sacct_filter: bool,
+    /// Which requeued attempts count as usage, matching the agent's option of
+    /// the same name. A report that split them differently from the agent would
+    /// disagree with the agent's own figures for the same jobs.
+    requeue_policy: RequeuePolicy,
 }
 
 const USAGE: &str = "\
@@ -91,6 +95,12 @@ Options:
   --sacct CMD     the sacct command to run (default: sacct). Accepts a
                   composite command, e.g. 'docker exec slurmctld sacct'.
   --cluster NAME  restrict the query to one cluster
+  --requeue-policy P
+                  which requeued attempts count as usage, as the slurm agent's
+                  requeue-policy option gives it: charge_requeue_state_only
+                  (the default) or no_charge. Set it to whatever the agent on
+                  this cluster is configured with, or this report's usage
+                  figures will not match the agent's.
   --sacct-filter  ask sacct to return only this reservation's jobs, instead
                   of reading every job and filtering here. Much less work on
                   a busy cluster, but --reservation is not available on every
@@ -116,6 +126,7 @@ fn parse_args() -> Result<Option<Options>> {
     let mut sacct = "sacct".to_string();
     let mut cluster = String::new();
     let mut sacct_filter = false;
+    let mut requeue_policy = RequeuePolicy::default();
 
     let mut remaining = args.into_iter();
 
@@ -130,6 +141,12 @@ fn parse_args() -> Result<Option<Options>> {
             "--node" => node = value("--node")?,
             "--sacct" => sacct = value("--sacct")?,
             "--cluster" => cluster = value("--cluster")?,
+            "--requeue-policy" => {
+                let requested = value("--requeue-policy")?;
+                requeue_policy = requested
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("{}. Try --help.", e))?;
+            }
             "--sacct-filter" => sacct_filter = true,
             other if other.starts_with('-') => {
                 anyhow::bail!("Unknown option '{}'. Try --help.", other);
@@ -155,6 +172,7 @@ fn parse_args() -> Result<Option<Options>> {
         sacct,
         cluster,
         sacct_filter,
+        requeue_policy,
     }))
 }
 
@@ -409,7 +427,13 @@ async fn collect(options: &Options, nodes: &SlurmNodes) -> Result<Collected> {
             .filter(|job| job.reservation().eq_ignore_ascii_case(&options.reservation))
             .count();
 
-        absorb_day(&mut collected, &jobs, &options.reservation, day);
+        absorb_day(
+            &mut collected,
+            &jobs,
+            &options.reservation,
+            day,
+            options.requeue_policy,
+        );
 
         // Both numbers, always: they are how an operator checks whether
         // `--sacct-filter` does what it claims. With it on the two should be
@@ -466,7 +490,13 @@ async fn collect(options: &Options, nodes: &SlurmNodes) -> Result<Collected> {
 /// Split out from the query so that it can be tested against a recorded `sacct`
 /// response - which is the half worth testing, the other being a subprocess.
 ///
-fn absorb_day(collected: &mut Collected, jobs: &[SlurmJob], reservation: &str, day: &Date) {
+fn absorb_day(
+    collected: &mut Collected,
+    jobs: &[SlurmJob],
+    reservation: &str,
+    day: &Date,
+    policy: RequeuePolicy,
+) {
     collected.days.push(day.clone());
 
     let start_time = day.day().start_time().and_utc();
@@ -495,7 +525,7 @@ fn absorb_day(collected: &mut Collected, jobs: &[SlurmJob], reservation: &str, d
         };
 
         let (report, totals) = days.entry(project).or_default();
-        record_job(report, job, &start_time, totals);
+        record_job(report, job, &start_time, policy, totals);
     }
 
     for (project, (report, totals)) in days {
@@ -1184,7 +1214,13 @@ mod tests {
         };
 
         for start in [DAY_ONE, DAY_TWO] {
-            absorb_day(&mut collected, &jobs_for(start), reservation, &day(start));
+            absorb_day(
+                &mut collected,
+                &jobs_for(start),
+                reservation,
+                &day(start),
+                RequeuePolicy::NoCharge,
+            );
         }
 
         collected

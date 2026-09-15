@@ -10,7 +10,7 @@ use std::sync::Arc;
 use templemeads::Error;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::slurm::{SlurmAccount, SlurmJob, SlurmNode, SlurmNodes, SlurmUser};
+use crate::slurm::{RequeuePolicy, SlurmAccount, SlurmJob, SlurmNode, SlurmNodes, SlurmUser};
 
 #[derive(Debug, Clone, Default)]
 struct UsageDatabase {
@@ -26,6 +26,11 @@ struct Database {
     accounts: HashMap<String, SlurmAccount>,
     users: HashMap<String, SlurmUser>,
     nodes: Option<SlurmNodes>,
+    /// Which requeued attempts are charged to a project. Set once at startup
+    /// from the `requeue-policy` option; the default is the one in
+    /// `RequeuePolicy`, so a cache that was never told still charges the way
+    /// the agent is documented to.
+    requeue_policy: RequeuePolicy,
     reports: HashMap<ProjectIdentifier, UsageDatabase>,
     user_mutexes: HashMap<UserIdentifier, Arc<Mutex<()>>>,
     project_mutexes: HashMap<ProjectIdentifier, Arc<Mutex<()>>>,
@@ -336,6 +341,23 @@ pub async fn set_node(name: &str, node: &SlurmNode) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+pub async fn set_requeue_policy(policy: RequeuePolicy) {
+    let mut cache = CACHE.write().await;
+    cache.requeue_policy = policy;
+}
+
+///
+/// Which requeued attempts are charged to a project.
+///
+/// Infallible, and deliberately so: every caller is in the middle of building a
+/// usage report, and there is no sensible way for one to handle "I could not
+/// find out what the policy is". An unset cache returns the default, which is
+/// the same answer a freshly configured agent would give.
+///
+pub async fn get_requeue_policy() -> RequeuePolicy {
+    CACHE.read().await.requeue_policy
 }
 
 pub async fn get_default_node() -> Result<SlurmNode, Error> {
