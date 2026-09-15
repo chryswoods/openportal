@@ -173,7 +173,7 @@ fn project_of_account(account: &str) -> Option<ProjectIdentifier> {
 }
 
 ///
-/// Ask Slurm for every job that ran on one day, for every account.
+/// Ask Slurm for every job that overlapped one window, for every account.
 ///
 /// Deliberately not filtered by account: the question is who used a
 /// reservation, and the answer is not known until the records are read.
@@ -185,23 +185,14 @@ fn project_of_account(account: &str) -> Option<ProjectIdentifier> {
 /// Either way the records are filtered again below, so the flag can only change
 /// how much is read, never what is reported.
 ///
-async fn jobs_on_day(
-    day: &Date,
+async fn jobs_between(
+    start_time: &chrono::DateTime<chrono::Utc>,
+    end_time: &chrono::DateTime<chrono::Utc>,
     nodes: &SlurmNodes,
     options: &Options,
     now: &chrono::DateTime<chrono::Utc>,
+    timeout: std::time::Duration,
 ) -> Result<Vec<SlurmJob>> {
-    let start_time = day.day().start_time().and_utc();
-    let end_time = day.day().end_time().and_utc();
-
-    if start_time > *now {
-        return Ok(Vec::new());
-    }
-
-    // never ask for the future - `sacct` is happy to be asked and the clipping
-    // would treat the rest of today as consumed
-    let end_time = end_time.min(*now);
-
     // a long expiry: this is a one-shot tool with a person waiting on it, not
     // an agent servicing a job with a deadline
     let expires = *now + chrono::Duration::hours(1);
@@ -240,17 +231,105 @@ async fn jobs_on_day(
         ],
     )?;
 
-    let response = runner(&expires)
-        .await?
-        .run_json(&cmd, QUERY_TIMEOUT)
-        .await?;
+    let response = runner(&expires).await?.run_json(&cmd, timeout).await?;
 
     Ok(SlurmJob::get_consumers(
-        &response,
-        &start_time,
-        &end_time,
-        nodes,
+        &response, start_time, end_time, nodes,
     )?)
+}
+
+/// What one day's reading came to: the records, and how many of the day's
+/// hours could not be read at all.
+struct DayRecords {
+    jobs: Vec<SlurmJob>,
+    missing_hours: usize,
+}
+
+///
+/// Ask Slurm for every job that ran on one day, for every account.
+///
+/// A day is asked for in one query first, because that is one query rather
+/// than twenty-four. When that query fails - however it fails - the day is
+/// asked for an hour at a time instead. An unfiltered day on a busy cluster is
+/// the heaviest thing this tool asks of `sacct`, and it does not always come
+/// back: it can be killed for running out of memory, cut off by a limit on the
+/// scheduler's side, or time out outright. Those exit in different ways but
+/// they mean the same thing - the window was too wide - and the answer to all
+/// of them is a narrower window.
+///
+/// An hour that fails in turn is skipped rather than fatal, and counted. There
+/// is nothing smaller left to try, and a report that is honest about the hour
+/// it is missing is worth far more to an operator than no report at all - not
+/// least because this tends to happen near the end of a long run, with every
+/// day before it already read.
+///
+async fn jobs_on_day(
+    day: &Date,
+    nodes: &SlurmNodes,
+    options: &Options,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> DayRecords {
+    let start_time = day.day().start_time().and_utc();
+    let end_time = day.day().end_time().and_utc();
+
+    if start_time > *now {
+        return DayRecords {
+            jobs: Vec::new(),
+            missing_hours: 0,
+        };
+    }
+
+    // never ask for the future - `sacct` is happy to be asked and the clipping
+    // would treat the rest of today as consumed
+    let end_time = end_time.min(*now);
+
+    let day_error =
+        match jobs_between(&start_time, &end_time, nodes, options, now, QUERY_TIMEOUT).await {
+            Ok(jobs) => {
+                return DayRecords {
+                    jobs,
+                    missing_hours: 0,
+                }
+            }
+            Err(e) => e,
+        };
+
+    tracing::warn!(
+        "Could not read {} in one query: {:#}. Reading it an hour at a time instead.",
+        day,
+        day_error
+    );
+
+    let mut jobs = Vec::new();
+    let mut missing_hours: usize = 0;
+
+    for hour in day.hours() {
+        let hour_start = hour.start_time().and_utc();
+
+        if hour_start > *now {
+            // the rest of the day has not happened yet
+            break;
+        }
+
+        let hour_end = hour.end_time().and_utc().min(*now);
+
+        match jobs_between(&hour_start, &hour_end, nodes, options, now, QUERY_TIMEOUT).await {
+            Ok(hour_jobs) => jobs.extend(hour_jobs),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not read {}: {:#}. This hour is missing from the report.",
+                    hour,
+                    e
+                );
+                missing_hours = missing_hours.saturating_add(1);
+            }
+        }
+    }
+
+    DayRecords {
+        jobs,
+        missing_hours,
+    }
 }
 
 /// What one day of the reservation came to, once the records are in.
@@ -270,6 +349,10 @@ struct Collected {
     /// tables are built from this so they show the period that was reported on
     /// rather than a run of empty rows for a future nobody can have used.
     days: Vec<Date>,
+    /// Days that could not be read whole, and how many of their hours are
+    /// missing. Every figure below is a lower bound while this is not empty,
+    /// so the report says so rather than looking complete.
+    gaps: Vec<(Date, usize)>,
 }
 
 ///
@@ -312,9 +395,14 @@ async fn collect(options: &Options, nodes: &SlurmNodes) -> Result<Collected> {
     for (index, day) in days.iter().enumerate() {
         tracing::info!("Processing day {} of {} ({})", index + 1, total_days, day);
 
-        let jobs = jobs_on_day(day, nodes, options, &now)
-            .await
-            .with_context(|| format!("Could not read Slurm accounting for {}", day))?;
+        let DayRecords {
+            jobs,
+            missing_hours,
+        } = jobs_on_day(day, nodes, options, &now).await;
+
+        if missing_hours > 0 {
+            collected.gaps.push((day.clone(), missing_hours));
+        }
 
         let kept = jobs
             .iter()
@@ -352,6 +440,21 @@ async fn collect(options: &Options, nodes: &SlurmNodes) -> Result<Collected> {
         total_days,
         collected.projects.len()
     );
+
+    if !collected.gaps.is_empty() {
+        let missing: usize = collected
+            .gaps
+            .iter()
+            .map(|(_, hours)| *hours)
+            .fold(0usize, |total, hours| total.saturating_add(hours));
+
+        tracing::warn!(
+            "{} hour(s) across {} day(s) could not be read from Slurm. Every figure in \
+             this report is therefore a lower bound.",
+            missing,
+            collected.gaps.len()
+        );
+    }
 
     Ok(collected)
 }
@@ -586,6 +689,7 @@ fn render(collected: &Collected) -> String {
         );
     }
 
+    let _ = write!(out, "{}", gaps_note(collected));
     let _ = write!(out, "{}", unmanaged_note(collected));
     let _ = writeln!(out, "{}", rule);
 
@@ -724,6 +828,52 @@ fn pooled(rest: &[(&ProjectIdentifier, &ProjectUsageReport)], day: &Date) -> (u6
             jobs.saturating_add(day_report.num_jobs()),
         )
     })
+}
+
+///
+/// What to say about the parts of the period that could not be read.
+///
+/// Slurm refusing an hour is not the same as nobody using the reservation in
+/// it, and a report that quietly conflated the two would understate a project's
+/// share without ever saying so. Naming the days keeps the figures usable: an
+/// operator can see whether the gap falls where it matters, and re-run those
+/// days on a quieter machine.
+///
+fn gaps_note(collected: &Collected) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+
+    let Some((first, rest)) = collected.gaps.split_first() else {
+        return out;
+    };
+
+    let missing = collected
+        .gaps
+        .iter()
+        .map(|(_, hours)| *hours)
+        .fold(0usize, |total, hours| total.saturating_add(hours));
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "INCOMPLETE: {} hour(s) could not be read from Slurm, so every figure below is",
+        missing
+    );
+    let _ = writeln!(
+        out,
+        "a lower bound - what ran in those hours is missing from it entirely."
+    );
+
+    let _ = write!(out, "Affected: {} ({}h)", first.0, first.1);
+
+    for (day, hours) in rest {
+        let _ = write!(out, ", {} ({}h)", day, hours);
+    }
+
+    let _ = writeln!(out);
+
+    out
 }
 
 /// `write!` needs a `fmt::Write`, and a `String` is one - this only exists to
@@ -1187,6 +1337,51 @@ mod tests {
 
         // and the account we cannot attribute is declared rather than dropped
         assert!(report.contains("root"));
+    }
+
+    #[test]
+    fn test_a_report_with_a_gap_in_it_says_so_before_any_figures() {
+        // An hour Slurm would not answer for is not an hour nobody used the
+        // reservation in, and the report must not let those two look alike.
+        let mut collected = collected_fixture("interactive");
+        collected.gaps.push((day(DAY_TWO), 3));
+
+        let report = render(&collected);
+
+        assert!(report.contains("INCOMPLETE"));
+        assert!(report.contains("lower bound"));
+        assert!(report.contains("2026-03-02 (3h)"));
+
+        // and it comes before the tables it qualifies, not after them
+        let Some(warning) = report.find("INCOMPLETE") else {
+            unreachable!("the warning was just asserted to be there");
+        };
+        let Some(table) = report.find("Day by day") else {
+            unreachable!("the fixture renders the day-by-day tables");
+        };
+        assert!(warning < table);
+    }
+
+    #[test]
+    fn test_a_report_with_no_gaps_carries_no_caveat_about_them() {
+        let report = render(&collected_fixture("interactive"));
+
+        assert!(!report.contains("INCOMPLETE"));
+        assert!(!report.contains("lower bound"));
+    }
+
+    #[test]
+    fn test_every_day_with_a_gap_is_named() {
+        let mut collected = collected_fixture("interactive");
+        collected.gaps.push((day(DAY_ONE), 1));
+        collected.gaps.push((day(DAY_TWO), 2));
+
+        let report = render(&collected);
+
+        assert!(report.contains("2026-03-01 (1h)"));
+        assert!(report.contains("2026-03-02 (2h)"));
+        // three hours over two days, not two hours or two days' worth
+        assert!(report.contains("3 hour(s)"));
     }
 
     #[test]

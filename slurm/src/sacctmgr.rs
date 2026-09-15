@@ -1364,10 +1364,25 @@ async fn complete_and_cache_if_final(
     daily_report: &mut DailyProjectUsageReport,
     totals: &ReportTotals,
     counters_agree: bool,
+    is_partial: bool,
     project: &ProjectMapping,
     day: &greatwestern::grammar::Date,
     now: &chrono::DateTime<Utc>,
 ) {
+    if is_partial {
+        // some part of the day could not be read at all - see `get_hourly_report`.
+        // What we have is the truth about the hours we did read, and nothing at
+        // all about the rest, so it must not be completed or cached: a cached
+        // day is never re-read, and this one has to be.
+        tracing::warn!(
+            "Not caching the report for project {} on {}: part of the day could not be \
+             read from Slurm, so the report is incomplete.",
+            project.project(),
+            day
+        );
+        return;
+    }
+
     if daily_report.total_usage().seconds() != totals.usage {
         // this points to some error when generating the values...
         tracing::error!(
@@ -1443,6 +1458,13 @@ async fn get_hourly_report(
     let mut daily_report = DailyProjectUsageReport::default();
     let mut totals = ReportTotals::default();
 
+    // Hours that Slurm would not answer for. An hour is a small enough piece
+    // that losing one is better than losing the whole run, so a failure here
+    // is skipped rather than propagated - but the day it belongs to is then
+    // only partly known, and must not be completed or cached as if it were
+    // whole.
+    let mut skipped_hours: usize = 0;
+
     // we need to get the report hour by hour from slurm, as users may have
     // run very large numbers of jobs in a day, and sacct may time out
     for hour in day.hours() {
@@ -1512,9 +1534,44 @@ async fn get_hourly_report(
         let response = runner(expires)
             .await?
             .run_json(&cmd, std::time::Duration::from_secs(120))
-            .await?;
+            .await;
 
-        let jobs = SlurmJob::get_consumers(&response, &start_time, &end_time, slurm_nodes)?;
+        // An hour is already the smallest piece we know how to ask for, so
+        // there is nothing left to fall back to: record that this one is
+        // missing and carry on with the rest of the day. This matters most at
+        // the end of a long reporting run, where one hour that `sacct` cannot
+        // answer would otherwise throw away every hour read before it.
+        let jobs = match response {
+            Ok(response) => {
+                match SlurmJob::get_consumers(&response, &start_time, &end_time, slurm_nodes) {
+                    Ok(jobs) => jobs,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not read the Slurm records for project {} for {}: {}. \
+                             This hour is missing from the report for {}.",
+                            project.project(),
+                            hour,
+                            e,
+                            day
+                        );
+                        skipped_hours = skipped_hours.saturating_add(1);
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Could not get usage for project {} for {}: {}. \
+                     This hour is missing from the report for {}.",
+                    project.project(),
+                    hour,
+                    e,
+                    day
+                );
+                skipped_hours = skipped_hours.saturating_add(1);
+                continue;
+            }
+        };
 
         tracing::debug!(
             "Got {} jobs for project {} on {}",
@@ -1560,6 +1617,17 @@ async fn get_hourly_report(
         totals.requeue_usage
     );
 
+    if skipped_hours > 0 {
+        tracing::warn!(
+            "The report for project {} on {} is missing {} of the day's hours, which \
+             Slurm could not be asked for. Its usage is therefore a lower bound, and \
+             the day will be read again rather than cached.",
+            project.project(),
+            day,
+            skipped_hours
+        );
+    }
+
     // runtime consistency check: local shadow counters must match the report's scalar totals
     let counters_agree = check_counter_consistency(&daily_report, &totals, project, day);
 
@@ -1567,6 +1635,7 @@ async fn get_hourly_report(
         &mut daily_report,
         &totals,
         counters_agree,
+        skipped_hours > 0,
         project,
         day,
         &now,
@@ -1680,6 +1749,7 @@ async fn get_daily_report(
                 &mut daily_report,
                 &totals,
                 counters_agree,
+                false,
                 project,
                 day,
                 &now,
@@ -1688,15 +1758,25 @@ async fn get_daily_report(
 
             Ok(daily_report)
         }
-        Err(Error::Timeout(_)) => {
+        Err(e) => {
+            // Any failure here means the same thing: a day was more than this
+            // `sacct` could answer in one go. A wall-clock timeout is only the
+            // politest of the ways that happens - an out-of-memory kill, or a
+            // limit enforced on the scheduler's side, exits non-zero instead,
+            // and output truncated part-way through comes back as JSON that
+            // will not parse. All three used to fall through to an empty
+            // report, which reads exactly like a project that ran nothing.
+            // Asking for the day an hour at a time is the answer to all of
+            // them, and if `sacct` is genuinely broken rather than merely
+            // overloaded, the hourly queries say so just as loudly.
             tracing::warn!(
-                "Timed out getting usage for project {} on {}. Switching to hourly reporting.",
+                "Could not get usage for project {} on {}: {}. Switching to hourly reporting.",
                 project.project(),
-                day
+                day,
+                e
             );
 
-            // we need to switch to getting an hourly report for this date
-            return get_hourly_report(
+            get_hourly_report(
                 expires,
                 project,
                 day,
@@ -1705,19 +1785,7 @@ async fn get_daily_report(
                 cluster,
                 partition_command,
             )
-            .await;
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Could not get usage for project {} on {}: {}",
-                project.project(),
-                day,
-                e
-            );
-
-            // we will return an empty report - this will not be complete
-            // and will not be cached
-            Ok(DailyProjectUsageReport::default())
+            .await
         }
     }
 }
