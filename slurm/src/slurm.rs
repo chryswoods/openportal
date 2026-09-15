@@ -2152,6 +2152,20 @@ impl SlurmLimit {
     pub fn billing_limit(&self) -> Option<Usage> {
         self.billing_limit
     }
+
+    ///
+    /// Whether Slurm holds any `GrpTRESMins` limit at all for this association.
+    ///
+    /// An association with none is *unlimited*, which is a different thing from
+    /// a limit of zero: the requeue correction must never turn the first into
+    /// the second by adding itself to nothing.
+    ///
+    pub fn has_any_limit(&self) -> bool {
+        self.cpu_limit.is_some()
+            || self.gpu_limit.is_some()
+            || self.mem_limit.is_some()
+            || self.billing_limit.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

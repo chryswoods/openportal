@@ -158,6 +158,11 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    // Reports compute the requeue correction; this writes it into Slurm, off
+    // the reporting path and on its own schedule. See
+    // `docs/plans/slurm-requeue-charging-design.md`.
+    sacctmgr::spawn_limit_applier();
+
     set_notify_runner::<Hpc>(default_notify_runner).await?;
 
     if slurm_server.is_empty() {

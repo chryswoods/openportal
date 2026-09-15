@@ -5,7 +5,7 @@ SPDX-License-Identifier: CC0-1.0
 
 # Slurm requeue charging: billing the user's own requeues, and the limit that follows
 
-Status: **designed, not implemented.**
+Status: **implemented**, as described below, with the deviations noted in §11.
 
 This is the sequel to `slurm-requeue-accounting-design.md`, which made the
 previously invisible consumption of requeued attempts *measurable* and
@@ -234,10 +234,12 @@ more important half of this rule.
 never "zero". The dangerous case is not the start of a month - there the
 correction genuinely is zero - but a restart mid-month, where treating unknown
 as zero would push `requested + 0` and silently withdraw headroom the project
-is already relying on. So: op-slurm never *lowers* an applied limit on the
-strength of a correction it has not computed for the current month. A
-`set_limit` arriving in that window is honoured for the `requested` value it
-carries, and the applied figure is left alone until the correction is known.
+is already relying on. So: **the applier** never raises a limit on a correction
+it has not computed, and never lowers one at all.
+
+A `set_limit` is different, and §11 records why: it is an instruction rather
+than a guess, so it is honoured at once with whatever correction is known, and
+the applier adds the rest within the hour.
 
 **5.2 The correction only ever increases, within a month.** The base/requeue
 split is window-local by design (`slurm-requeue-accounting-design.md` §3, §5.2)
@@ -362,3 +364,37 @@ communicated before it appears on an invoice rather than after.
   the only place that knows the choice was made.
 - **Per-partition or per-QoS policies.** The enum admits them; nothing asks for
   them.
+
+## 11. Deviations from the design as built
+
+- **`set_limit` writes immediately, with whatever correction is known.** §5.1
+  first said the applied figure should be left alone until the correction was
+  known. That is wrong for the case that matters most: the caller zeroes a
+  limit when a project overspends, and holding that back would leave the
+  project running on an allowance it has already exhausted. A `set_limit` is an
+  instruction, not an inference, so it is applied at once - with the correction
+  if one is known, without it if not, and the hourly applier makes up the
+  difference. The rule it was protecting still holds where it belongs: the
+  applier only ever raises.
+
+- **`get_limit` recovers the requested limit rather than giving up on it.**
+  §4.2 described the window after a restart as one where `get_limit` cannot say
+  what was requested. It can, once a usage report has run:
+  `requested = observed - applied correction`, which it records. Only before
+  that does it return the Slurm figure with a warning.
+
+- **"Slurm holds no limit" means no association row *or* an association with no
+  `GrpTRESMins`.** The second is the case that actually occurs, and
+  `SlurmLimit::has_any_limit` is what distinguishes it. Both are unlimited, and
+  the applier leaves both alone.
+
+- **The charged-state check lives in op-slurm, not in the report.** §3.1 listed
+  "no charged state may be one the policy does not charge" with the report's own
+  consistency checks. It cannot live there: a report travels between agents, and
+  the policy belongs to the agent reading it rather than to the report. It is
+  checked in `check_counter_consistency`, which is where the policy is in scope.
+
+- **A charged requeue still counts towards a reservation's discarded share.**
+  `reservation_requeue_usage` records what a reservation's occupancy owed to
+  requeued attempts, which is a question about occupancy rather than about
+  charging, so both kinds belong in it.
