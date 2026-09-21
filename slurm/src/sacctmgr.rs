@@ -3630,15 +3630,75 @@ mod tests {
     fn test_no_charge_leaves_every_figure_where_it_was() {
         // The escape hatch has to be exactly the old behaviour, or a site that
         // sets it is not opting out of anything.
+        //
+        // The figures are the ones this fixture reported before charging
+        // existed, written out rather than derived, so that a change to the
+        // split has to come here and say so. Other tests in this module pin the
+        // same two numbers through `report_for`, but only because that helper
+        // happens to default to this policy - which is not a guarantee, it is a
+        // default someone could change.
         let (report, totals) = report_for_policy(day_one(), RequeuePolicy::NoCharge);
+
+        assert_eq!(report.total_usage(), Usage::new(28800));
+        assert_eq!(report.total_requeue_usage(), Usage::new(20700));
+        assert_eq!(report.num_jobs(), 9);
+        assert_eq!(report.num_requeue_events(), 7);
+
+        // And the same figures derived from the records rather than recited:
+        // with nothing charged, what is reported is exactly the base attempts
+        // and what is discarded is exactly the superseded ones. This is the
+        // property; the constants above are the witness that it has not moved.
+        let jobs = consumers_for(day_one());
+
+        let summed = |requeued: bool| {
+            Usage::new(
+                jobs.iter()
+                    .filter(|job| job.is_requeued_attempt() == requeued)
+                    .fold(0u64, |total, job| {
+                        total.saturating_add(job.billed_node_seconds())
+                    }),
+            )
+        };
+
+        assert_eq!(report.total_usage(), summed(false));
+        assert_eq!(report.total_requeue_usage(), summed(true));
 
         assert!(!report.has_charged_requeues());
         assert!(report.charged_requeue_states().is_empty());
         assert_eq!(totals.charged_requeue_events, 0);
         assert_eq!(totals.charged_requeue_usage, 0);
+    }
+
+    #[test]
+    fn test_charging_leaves_the_true_total_and_the_base_attempts_alone() {
+        // The other half of the same guarantee: turning charging *on* must not
+        // move the base attempts either. Only the superseded ones change
+        // bucket, so what a project consumed in total is the same figure under
+        // both policies - which is what makes the switch a charging decision
+        // rather than a change of measurement.
+        let jobs = consumers_for(day_one());
+
+        let base = Usage::new(
+            jobs.iter()
+                .filter(|job| !job.is_requeued_attempt())
+                .fold(0u64, |total, job| {
+                    total.saturating_add(job.billed_node_seconds())
+                }),
+        );
+
+        let (charged, _) = report_for_policy(day_one(), RequeuePolicy::ChargeRequeueStateOnly);
+
+        // the base attempts are untouched: what charging added is exactly the
+        // charged requeues, no more
         assert_eq!(
-            report.total_usage_including_requeues(),
-            report.total_usage() + report.total_requeue_usage()
+            charged.total_usage(),
+            base + charged.total_charged_requeue_usage()
+        );
+
+        // and the true total is the same 49500 seconds either way
+        assert_eq!(
+            charged.total_usage_including_requeues(),
+            Usage::new(28800 + 20700)
         );
     }
 
