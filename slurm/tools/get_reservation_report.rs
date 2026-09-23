@@ -36,7 +36,8 @@ use anyhow::{Context, Result};
 use greatwestern::grammar::{Date, DateRange, ProjectIdentifier};
 use greatwestern::usagereport::{DailyProjectUsageReport, ProjectUsageReport, Usage};
 
-use op_slurm::sacctmgr::{record_job, runner, set_commands, ReportTotals};
+use op_slurm::dayquery::{jobs_on_day, DayRecords, JobQuery};
+use op_slurm::sacctmgr::{record_job, set_commands, ReportTotals};
 use op_slurm::slurm::{RequeuePolicy, SlurmJob, SlurmNode, SlurmNodes};
 
 ///
@@ -49,12 +50,6 @@ use op_slurm::slurm::{RequeuePolicy, SlurmJob, SlurmNode, SlurmNodes};
 /// how wrong this is.
 ///
 const DEFAULT_NODE: &str = r#"{ "cpus": 288, "gpus": 4, "mem": 491520, "billing": 864 }"#;
-
-/// A day's query can return a lot of records on a busy cluster, so this is
-/// generous compared with the agent's own thirty seconds. A tool run by hand
-/// can afford to wait; being told "timed out" is not an answer an operator can
-/// use.
-const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Projects shown as their own column in the day-by-day tables before the rest
 /// are gathered into `other`. Wide enough to see who the reservation is for,
@@ -191,7 +186,7 @@ fn project_of_account(account: &str) -> Option<ProjectIdentifier> {
 }
 
 ///
-/// Ask Slurm for every job that overlapped one window, for every account.
+/// What to ask `sacct` for, for one day of this report.
 ///
 /// Deliberately not filtered by account: the question is who used a
 /// reservation, and the answer is not known until the records are read.
@@ -203,150 +198,14 @@ fn project_of_account(account: &str) -> Option<ProjectIdentifier> {
 /// Either way the records are filtered again below, so the flag can only change
 /// how much is read, never what is reported.
 ///
-async fn jobs_between(
-    start_time: &chrono::DateTime<chrono::Utc>,
-    end_time: &chrono::DateTime<chrono::Utc>,
-    nodes: &SlurmNodes,
-    options: &Options,
-    now: &chrono::DateTime<chrono::Utc>,
-    timeout: std::time::Duration,
-) -> Result<Vec<SlurmJob>> {
-    // a long expiry: this is a one-shot tool with a person waiting on it, not
-    // an agent servicing a job with a deadline
-    let expires = *now + chrono::Duration::hours(1);
-
-    let cluster_arg = match options.cluster.is_empty() {
-        true => String::new(),
-        false => format!("--cluster={}", options.cluster),
-    };
-
-    // Off by default: `--reservation` is not available on every `sacct` this
-    // may meet, and one that quietly means something else would silently change
-    // what the report covers. Where it does work it is worth a great deal on a
-    // busy cluster - the alternative is reading every job on the machine and
-    // discarding nearly all of them. The records kept are filtered here either
-    // way, so turning this on can narrow what is read but can never widen what
-    // is reported.
-    let reservation_arg = match options.sacct_filter {
-        true => format!("--reservation={}", options.reservation),
-        false => String::new(),
-    };
-
-    let cmd = runner(&expires).await?.build_command(
-        "SACCT",
-        vec![
-            "--noconvert".to_string(),
-            "--allocations".to_string(),
-            "--allusers".to_string(),
-            // one record per attempt - without this everything a requeued job
-            // consumed before its final attempt is invisible
-            "--duplicates".to_string(),
-            format!("--starttime={}", start_time.format("%Y-%m-%dT%H:%M:%S")),
-            format!("--endtime={}", end_time.format("%Y-%m-%dT%H:%M:%S")),
-            cluster_arg,
-            reservation_arg,
-            "--json".to_string(),
-        ],
-    )?;
-
-    let response = runner(&expires).await?.run_json(&cmd, timeout).await?;
-
-    Ok(SlurmJob::get_consumers(
-        &response, start_time, end_time, nodes,
-    )?)
-}
-
-/// What one day's reading came to: the records, and how many of the day's
-/// hours could not be read at all.
-struct DayRecords {
-    jobs: Vec<SlurmJob>,
-    missing_hours: usize,
-}
-
-///
-/// Ask Slurm for every job that ran on one day, for every account.
-///
-/// A day is asked for in one query first, because that is one query rather
-/// than twenty-four. When that query fails - however it fails - the day is
-/// asked for an hour at a time instead. An unfiltered day on a busy cluster is
-/// the heaviest thing this tool asks of `sacct`, and it does not always come
-/// back: it can be killed for running out of memory, cut off by a limit on the
-/// scheduler's side, or time out outright. Those exit in different ways but
-/// they mean the same thing - the window was too wide - and the answer to all
-/// of them is a narrower window.
-///
-/// An hour that fails in turn is skipped rather than fatal, and counted. There
-/// is nothing smaller left to try, and a report that is honest about the hour
-/// it is missing is worth far more to an operator than no report at all - not
-/// least because this tends to happen near the end of a long run, with every
-/// day before it already read.
-///
-async fn jobs_on_day(
-    day: &Date,
-    nodes: &SlurmNodes,
-    options: &Options,
-    now: &chrono::DateTime<chrono::Utc>,
-) -> DayRecords {
-    let start_time = day.day().start_time().and_utc();
-    let end_time = day.day().end_time().and_utc();
-
-    if start_time > *now {
-        return DayRecords {
-            jobs: Vec::new(),
-            missing_hours: 0,
-        };
-    }
-
-    // never ask for the future - `sacct` is happy to be asked and the clipping
-    // would treat the rest of today as consumed
-    let end_time = end_time.min(*now);
-
-    let day_error =
-        match jobs_between(&start_time, &end_time, nodes, options, now, QUERY_TIMEOUT).await {
-            Ok(jobs) => {
-                return DayRecords {
-                    jobs,
-                    missing_hours: 0,
-                }
-            }
-            Err(e) => e,
-        };
-
-    tracing::warn!(
-        "Could not read {} in one query: {:#}. Reading it an hour at a time instead.",
-        day,
-        day_error
-    );
-
-    let mut jobs = Vec::new();
-    let mut missing_hours: usize = 0;
-
-    for hour in day.hours() {
-        let hour_start = hour.start_time().and_utc();
-
-        if hour_start > *now {
-            // the rest of the day has not happened yet
-            break;
-        }
-
-        let hour_end = hour.end_time().and_utc().min(*now);
-
-        match jobs_between(&hour_start, &hour_end, nodes, options, now, QUERY_TIMEOUT).await {
-            Ok(hour_jobs) => jobs.extend(hour_jobs),
-            Err(e) => {
-                tracing::warn!(
-                    "Could not read {}: {:#}. This hour is missing from the report.",
-                    hour,
-                    e
-                );
-                missing_hours = missing_hours.saturating_add(1);
-            }
-        }
-    }
-
-    DayRecords {
-        jobs,
-        missing_hours,
+fn query_for(options: &Options) -> JobQuery {
+    JobQuery {
+        cluster: options.cluster.clone(),
+        account: String::new(),
+        reservation: match options.sacct_filter {
+            true => options.reservation.clone(),
+            false => String::new(),
+        },
     }
 }
 
@@ -416,7 +275,7 @@ async fn collect(options: &Options, nodes: &SlurmNodes) -> Result<Collected> {
         let DayRecords {
             jobs,
             missing_hours,
-        } = jobs_on_day(day, nodes, options, &now).await;
+        } = jobs_on_day(day, nodes, &query_for(options), &now).await;
 
         if missing_hours > 0 {
             collected.gaps.push((day.clone(), missing_hours));

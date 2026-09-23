@@ -4276,11 +4276,14 @@ impl ProjectUsageReport {
         let charged_events = self.num_charged_requeue_events();
         let _ = writeln!(
             out,
-            "{} absorbed requeue {}, {} charged | queue wait discarded: {} in total, \
-             {} per absorbed requeue",
+            "{} absorbed requeue {}, {} charged",
             events,
             if events == 1 { "event" } else { "events" },
-            charged_events,
+            charged_events
+        );
+        let _ = writeln!(
+            out,
+            "Queue wait discarded: {} in total, {} per absorbed requeue",
             Usage::new(self.requeue_wait_seconds()).in_hours(),
             Usage::new(self.average_requeue_wait_seconds()).in_hours()
         );
