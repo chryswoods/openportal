@@ -79,6 +79,25 @@ const MAX_NODE_ROWS: usize = 15;
 ///
 const CLUSTER_WIDE_DAYS_BEFORE_WARNING: usize = 7;
 
+///
+/// How to rank the nodes Slurm blamed for losing work.
+///
+/// The two orderings answer different questions, and neither subsumes the
+/// other. By hours lost, the top of the table is where the *work* went - and a
+/// single failure that killed one very long job outranks a node that has failed
+/// all week on short ones. By failure count, the same table finds the node that
+/// keeps failing, which is the one to pull out of service whatever it happened
+/// to be running at the time.
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum NodeOrder {
+    /// Most hours lost first.
+    #[default]
+    ByUsage,
+    /// Most failures first.
+    ByFailures,
+}
+
 struct Options {
     /// The project to report on, or `None` for the whole cluster.
     project: Option<ProjectIdentifier>,
@@ -87,6 +106,7 @@ struct Options {
     sacct: String,
     cluster: String,
     requeue_policy: RequeuePolicy,
+    node_order: NodeOrder,
 }
 
 const USAGE: &str = "\
@@ -108,6 +128,10 @@ Options:
   --sacct CMD     the sacct command to run (default: sacct). Accepts a
                   composite command, e.g. 'docker exec slurmctld sacct'.
   --cluster NAME  restrict the query to one cluster
+  --by-failures   rank the blamed-nodes table by how many times each node
+                  failed, rather than by the hours it lost. Finds the node
+                  that keeps failing, rather than the one that happened to
+                  be running the longest job when it did. Cluster-wide only.
   --requeue-policy P
                   which requeued attempts count as usage, as the slurm
                   agent's requeue-policy option gives it:
@@ -136,6 +160,7 @@ fn parse_args() -> Result<Option<Options>> {
     let mut cluster = String::new();
     let mut cluster_wide = false;
     let mut requeue_policy = RequeuePolicy::default();
+    let mut node_order = NodeOrder::default();
 
     let mut remaining = args.into_iter();
 
@@ -151,6 +176,7 @@ fn parse_args() -> Result<Option<Options>> {
             "--sacct" => sacct = value("--sacct")?,
             "--cluster" => cluster = value("--cluster")?,
             "--cluster-wide" => cluster_wide = true,
+            "--by-failures" => node_order = NodeOrder::ByFailures,
             "--requeue-policy" => {
                 let requested = value("--requeue-policy")?;
                 requeue_policy = requested
@@ -186,6 +212,13 @@ fn parse_args() -> Result<Option<Options>> {
         ),
     };
 
+    if project.is_some() && node_order == NodeOrder::ByFailures {
+        tracing::warn!(
+            "--by-failures orders the blamed-nodes table, which only a --cluster-wide \
+             report has. It will have no effect on a single project's report."
+        );
+    }
+
     let dates = DateRange::parse(period)
         .with_context(|| format!("Could not read '{}' as a period. Try --help.", period))?;
 
@@ -196,6 +229,7 @@ fn parse_args() -> Result<Option<Options>> {
         sacct,
         cluster,
         requeue_policy,
+        node_order,
     }))
 }
 
@@ -544,7 +578,7 @@ fn render_project(project: &ProjectIdentifier, collected: &Collected) -> String 
 ///
 /// The cluster-wide summary.
 ///
-fn render_cluster(collected: &Collected) -> String {
+fn render_cluster(collected: &Collected, node_order: NodeOrder) -> String {
     let mut out = String::new();
     let rule = "=".repeat(REPORT_WIDTH);
 
@@ -677,7 +711,7 @@ fn render_cluster(collected: &Collected) -> String {
     let _ = write!(out, "{}", render_states(collected, &percent));
     let _ = write!(out, "{}", render_projects(collected));
     let _ = write!(out, "{}", render_days(collected));
-    let _ = write!(out, "{}", render_failed_nodes(collected));
+    let _ = write!(out, "{}", render_failed_nodes(collected, node_order));
     let _ = write!(out, "{}", render_unmanaged(collected));
 
     let _ = writeln!(out, "{}", rule);
@@ -886,7 +920,7 @@ fn render_days(collected: &Collected) -> String {
 /// This is the actionable half of the report: `NODE_FAIL` time is the site's
 /// own, and a node that appears here repeatedly is a node to look at.
 ///
-fn render_failed_nodes(collected: &Collected) -> String {
+fn render_failed_nodes(collected: &Collected, order: NodeOrder) -> String {
     let mut out = String::new();
 
     if collected.failed_nodes.is_empty() {
@@ -895,17 +929,34 @@ fn render_failed_nodes(collected: &Collected) -> String {
 
     let mut nodes: Vec<(&String, &NodeFailures)> = collected.failed_nodes.iter().collect();
 
-    nodes.sort_by(|a, b| {
-        b.1.usage
-            .cmp(&a.1.usage)
-            .then_with(|| b.1.events.cmp(&a.1.events))
-            .then_with(|| a.0.cmp(b.0))
+    // Whichever key is not the primary one still breaks the ties, so the order
+    // is total either way and the table does not shuffle between runs.
+    nodes.sort_by(|a, b| match order {
+        NodeOrder::ByUsage => {
+            b.1.usage
+                .cmp(&a.1.usage)
+                .then_with(|| b.1.events.cmp(&a.1.events))
+                .then_with(|| a.0.cmp(b.0))
+        }
+        NodeOrder::ByFailures => {
+            b.1.events
+                .cmp(&a.1.events)
+                .then_with(|| b.1.usage.cmp(&a.1.usage))
+                .then_with(|| a.0.cmp(b.0))
+        }
     });
 
     let (rows, rest) = nodes.split_at(nodes.len().min(MAX_NODE_ROWS));
 
     let _ = writeln!(out);
-    let _ = writeln!(out, "Nodes Slurm blamed for losing work:");
+    let _ = writeln!(
+        out,
+        "Nodes Slurm blamed for losing work, {}:",
+        match order {
+            NodeOrder::ByUsage => "by hours lost",
+            NodeOrder::ByFailures => "by how often each failed",
+        }
+    );
     let _ = writeln!(out, "{}", "-".repeat(REPORT_WIDTH));
     let _ = writeln!(out, "{:<24} {:>10} {:>8}", "node", "lost", "failures");
 
@@ -927,6 +978,14 @@ fn render_failed_nodes(collected: &Collected) -> String {
         out,
         "Only failures Slurm named a node for are here; it does not always name one."
     );
+
+    if order == NodeOrder::ByUsage && nodes.len() > MAX_NODE_ROWS {
+        let _ = writeln!(
+            out,
+            "A node that fails often on short jobs will not be near the top of this"
+        );
+        let _ = writeln!(out, "ordering - --by-failures finds those.");
+    }
 
     out
 }
@@ -977,7 +1036,7 @@ fn elide(name: &str, width: usize) -> String {
 fn render(options: &Options, collected: &Collected) -> String {
     match &options.project {
         Some(project) => render_project(project, collected),
-        None => render_cluster(collected),
+        None => render_cluster(collected, options.node_order),
     }
 }
 
@@ -1134,7 +1193,7 @@ mod tests {
     #[test]
     fn test_the_cluster_report_ranks_projects_by_what_requeueing_cost_them() {
         let collected = collected_fixture(RequeuePolicy::default());
-        let report = render_cluster(&collected);
+        let report = render_cluster(&collected, NodeOrder::default());
 
         let position = |needle: &str| report.find(needle);
 
@@ -1154,7 +1213,7 @@ mod tests {
     #[test]
     fn test_the_cluster_report_separates_the_sites_faults_from_the_users_choices() {
         let collected = collected_fixture(RequeuePolicy::default());
-        let report = render_cluster(&collected);
+        let report = render_cluster(&collected, NodeOrder::default());
 
         // three hours of node failure and half an hour of preemption are the
         // site's; three hours of plain requeue are the user's
@@ -1199,9 +1258,99 @@ mod tests {
         assert_eq!(failures.events, 2);
         assert_eq!(failures.usage, 7200 + 3600);
 
-        let report = render_cluster(&collected);
+        let report = render_cluster(&collected, NodeOrder::default());
         assert!(report.contains("badnode01"), "{}", report);
         assert!(report.contains("Nodes Slurm blamed"), "{}", report);
+    }
+
+    /// Nodes in the shape production actually has them: one that failed once
+    /// while running something enormous, and one that keeps failing on small
+    /// work. Which of the two is "worst" is the question the flag answers.
+    fn collected_with_nodes() -> Collected {
+        let mut collected = Collected::default();
+
+        collected.failed_nodes.insert(
+            "unlucky01".to_string(),
+            NodeFailures {
+                events: 1,
+                usage: 3600 * 600,
+            },
+        );
+        collected.failed_nodes.insert(
+            "sick01".to_string(),
+            NodeFailures {
+                events: 8,
+                usage: 3600 * 200,
+            },
+        );
+        collected.failed_nodes.insert(
+            "quiet01".to_string(),
+            NodeFailures {
+                events: 1,
+                usage: 3600 * 50,
+            },
+        );
+
+        collected
+    }
+
+    #[test]
+    fn test_the_node_table_can_be_ranked_by_hours_or_by_failures() {
+        let collected = collected_with_nodes();
+
+        let by_usage = render_failed_nodes(&collected, NodeOrder::ByUsage);
+        let by_failures = render_failed_nodes(&collected, NodeOrder::ByFailures);
+
+        let first_node = |report: &str| -> String {
+            report
+                .lines()
+                .skip_while(|line| !line.starts_with("node "))
+                .nth(1)
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // the node that lost the most work, against the node that keeps failing
+        assert_eq!(first_node(&by_usage), "unlucky01", "{}", by_usage);
+        assert_eq!(first_node(&by_failures), "sick01", "{}", by_failures);
+
+        // and the heading says which question is being answered, so a report
+        // pasted into a ticket cannot be read as the other one
+        assert!(by_usage.contains("by hours lost"), "{}", by_usage);
+        assert!(
+            by_failures.contains("by how often each failed"),
+            "{}",
+            by_failures
+        );
+    }
+
+    #[test]
+    fn test_the_node_ordering_is_total_so_the_table_does_not_shuffle() {
+        // Both keys tie on `quiet01` and `unlucky01` in one ordering or the
+        // other, so without a name to break the tie the table would come out
+        // differently on each run of the same data - which is exactly what
+        // makes two reports impossible to compare.
+        let collected = collected_with_nodes();
+
+        for order in [NodeOrder::ByUsage, NodeOrder::ByFailures] {
+            let first = render_failed_nodes(&collected, order);
+
+            for _ in 0..8 {
+                assert_eq!(render_failed_nodes(&collected, order), first);
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_cluster_with_no_blamed_nodes_prints_no_table() {
+        // Slurm does not always name a node, and a heading over nothing reads
+        // as though it did and found none.
+        let collected = Collected::default();
+
+        assert!(render_failed_nodes(&collected, NodeOrder::ByUsage).is_empty());
     }
 
     #[test]
@@ -1214,14 +1363,14 @@ mod tests {
         assert_eq!(collected.requeued_jobs.len(), 4);
         assert!(!collected.requeued_jobs.contains(&600));
 
-        let report = render_cluster(&collected);
+        let report = render_cluster(&collected, NodeOrder::default());
         assert!(report.contains("distinct job"), "{}", report);
     }
 
     #[test]
     fn test_the_cluster_report_declares_the_accounts_it_left_out() {
         let collected = collected_fixture(RequeuePolicy::default());
-        let report = render_cluster(&collected);
+        let report = render_cluster(&collected, NodeOrder::default());
 
         assert!(report.contains("does not manage"), "{}", report);
         assert!(report.contains("root"), "{}", report);
@@ -1234,7 +1383,7 @@ mod tests {
         let mut collected = collected_fixture(RequeuePolicy::default());
         collected.gaps.push((day(DAY_ONE), 2));
 
-        let report = render_cluster(&collected);
+        let report = render_cluster(&collected, NodeOrder::default());
 
         assert!(report.contains("INCOMPLETE"), "{}", report);
         assert!(report.contains("2026-03-01 (2h)"), "{}", report);
@@ -1279,7 +1428,7 @@ mod tests {
     #[test]
     fn test_a_cluster_with_nothing_on_it_says_so_rather_than_dividing_by_zero() {
         let collected = Collected::default();
-        let report = render_cluster(&collected);
+        let report = render_cluster(&collected, NodeOrder::default());
 
         assert!(report.contains("No usage at all"), "{}", report);
     }
