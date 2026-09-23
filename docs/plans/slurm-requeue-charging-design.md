@@ -6,6 +6,9 @@ SPDX-License-Identifier: CC0-1.0
 # Slurm requeue charging: billing the user's own requeues, and the limit that follows
 
 Status: **implemented**, as described below, with the deviations noted in §11.
+The reporting half has been exercised at cluster scale on a production machine,
+through `get_requeue_report --cluster-wide` over a full month; the limit
+correction of §4 has not yet run in production.
 
 This is the sequel to `slurm-requeue-accounting-design.md`, which made the
 previously invisible consumption of requeued attempts *measurable* and

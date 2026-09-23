@@ -22,7 +22,11 @@
 //!
 //! Cluster-wide mode reads *every* job on the machine for each day in the
 //! period, which is the heaviest thing anything here asks of `sacct`. Keep the
-//! period short.
+//! period short - though "short" turns out to be more generous than expected:
+//! a whole month, cluster-wide, has been run on a production machine with
+//! several hundred projects and half a million jobs, and came back with a
+//! report. The warning above that many days stands as advice rather than as a
+//! prediction of failure.
 //!
 
 // Every dependency of this crate is declared for the library, which the
