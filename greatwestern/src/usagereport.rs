@@ -406,25 +406,324 @@ impl UserUsageReport {
     }
 }
 
+/// Whether a counter is zero, for `skip_serializing_if`.
+///
+/// A report only states what it has to say: an empty map or a zero counter is
+/// left out of the JSON entirely rather than written as `{}` or `0`, and read
+/// back by the `serde(default)` on every one of these fields. It keeps a report
+/// carrying one day of one project's work legible, and it is what lets a reader
+/// that predates a statistic behave identically to one that has simply not seen
+/// it - see `docs/plans/slurm-requeue-accounting-design.md`.
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+///
+/// Add `value` to a keyed counter, saturating rather than wrapping.
+///
+/// Every counter in these reports is fed either from a peer's report or from a
+/// Slurm record, and release builds set `overflow-checks = true` alongside
+/// `panic = "abort"` - so a bare `+=` on one of these is a remote process kill.
+/// The scalar totals beside these maps have always saturated; going through
+/// this keeps the pair of them from disagreeing about what a huge value means,
+/// which is the difference between a report that clamps and a report that
+/// fails `is_consistent`.
+///
+fn accumulate(counters: &mut HashMap<String, u64>, key: &str, value: u64) {
+    let counter = counters.entry(key.to_string()).or_default();
+    *counter = counter.saturating_add(value);
+}
+
+///
+/// Remap the user keys of a counter map, merging where two old names map onto
+/// one new one.
+///
+/// `into_iter().map(...).collect()` reads as the obvious way to do this and is
+/// wrong: a `HashMap` built that way keeps whichever colliding entry came last
+/// and drops the rest, silently losing a user's jobs when two local accounts
+/// are consolidated into one.
+///
+fn remap_counters(
+    counters: HashMap<String, u64>,
+    string_map: &HashMap<String, String>,
+) -> HashMap<String, u64> {
+    let mut remapped: HashMap<String, u64> = HashMap::new();
+
+    for (user, count) in counters {
+        let user = string_map.get(&user).cloned().unwrap_or(user);
+        accumulate(&mut remapped, &user, count);
+    }
+
+    remapped
+}
+
+/// `remap_counters` for a map of `Usage`.
+fn remap_usages(
+    usages: HashMap<String, Usage>,
+    string_map: &HashMap<String, String>,
+) -> HashMap<String, Usage> {
+    let mut remapped: HashMap<String, Usage> = HashMap::new();
+
+    for (user, usage) in usages {
+        let user = string_map.get(&user).cloned().unwrap_or(user);
+        *remapped.entry(user).or_default() += usage;
+    }
+
+    remapped
+}
+
+/// `remap_usages` for a map keyed by component or reservation first, whose
+/// inner maps are keyed by user.
+fn remap_nested_usages(
+    nested: HashMap<String, HashMap<String, Usage>>,
+    string_map: &HashMap<String, String>,
+) -> HashMap<String, HashMap<String, Usage>> {
+    nested
+        .into_iter()
+        .map(|(outer, usages)| (outer, remap_usages(usages, string_map)))
+        .collect()
+}
+
+/// Total a map of counters, saturating. `Iterator::sum` panics on overflow
+/// under `overflow-checks`, which would turn the consistency checks below from
+/// something that reports a bad report into something that dies on one.
+fn sum_counters(counters: &HashMap<String, u64>) -> u64 {
+    counters
+        .values()
+        .fold(0u64, |total, count| total.saturating_add(*count))
+}
+
+/// Expansion factors are accumulated as thousandths, so that summing them is
+/// exact and order-independent - see the field comments in
+/// [`DailyProjectUsageReport`].
+const EXPANSION_SCALE: u64 = 1000;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct DailyProjectUsageReport {
-    reports: HashMap<String, Usage>,
+    // Still written even when empty, unlike every field below: release 0.92.0
+    // has no `serde(default)` on `reports` or `is_complete`, so omitting them
+    // would make a peer of that version fail outright rather than read a
+    // default. The `default` here lets a *later* release stop writing them.
     #[serde(default)]
+    reports: HashMap<String, Usage>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     components: HashMap<String, HashMap<String, Usage>>,
     /// Per-user job counts. Empty when reading data from older instances.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     user_job_counts: HashMap<String, u64>,
     /// Per-user wait seconds. Empty when reading data from older instances.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     user_wait_seconds: HashMap<String, u64>,
     /// Scalar total — equals sum of user_job_counts when populated, otherwise
     /// carries the value from older instances that lack per-user maps.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     num_jobs: u64,
     /// Scalar total — equals sum of user_wait_seconds when populated.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     total_wait_seconds: u64,
+
+    // ---- Expansion factor ---------------------------------------------------
+    //
+    // Turnaround over runtime, per job - `(wait + run) / run`, the classical
+    // definition, which is 1.0 for a job that started the instant it was
+    // eligible and rises with every second spent queueing. It says how much
+    // waiting a project endured for the work it got. A rising figure is worth
+    // looking at: a job that queues for hours and then exits in seconds, over
+    // and over, is what a user struggling to debug something looks like from the
+    // outside.
+    //
+    // The sum of the per-job *ratios* is kept, not a ratio of sums, because the
+    // two answer different questions and fail in opposite directions. The mean
+    // of ratios is dominated by a short job that waited a long time, which is
+    // exactly the case worth catching; a ratio of sums is dominated by whichever
+    // job ran longest, which hides it. Total runtime is kept as well so both are
+    // available - see `average_expansion_factor` and
+    // `aggregate_expansion_factor`.
+    //
+    // The ratios are accumulated as thousandths rather than as floating point.
+    // Float addition is not associative, so summing the same reports in a
+    // different order would give a different total, and these reports are
+    // merged out of `HashMap`s whose order is arbitrary; the shadow-counter
+    // checks would then fail for no reason. Thousandths of an expansion factor
+    // is far finer than anyone reads.
+    /// Per-user sum of per-job expansion factors, in thousandths.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_expansion_milli: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_expansion_milli when populated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    total_expansion_milli: u64,
+    /// Per-user total wall-clock runtime, in seconds. Not the same as usage,
+    /// which is weighted by the fraction of a node a job held.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_runtime_seconds: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_runtime_seconds when populated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    total_runtime_seconds: u64,
+    // The denominator for the two figures above, and deliberately not
+    // `num_jobs`. A job whose runtime is not yet known - one still running when
+    // the window was closed - is counted as a job and contributes no runtime,
+    // so dividing by `num_jobs` would average a sum over a population it was
+    // never summed across, quietly dragging every mean towards zero. Keeping
+    // the count that the sums were actually accumulated over makes the
+    // denominator answer the same question as the numerator.
+    /// Per-user count of the jobs that contributed a runtime and an expansion
+    /// factor. Empty when reading data from older instances.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_expansion_jobs: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_expansion_jobs when populated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    num_expansion_jobs: u64,
+
+    // ---- Job size -----------------------------------------------------------
+    //
+    // The cores and GPUs each job was allocated, summed, so that dividing by the
+    // job count gives the mean size of a job - which says whether a project is
+    // running many small jobs or a few large ones. This cannot be recovered from
+    // usage: usage is core-seconds, and the same core-seconds come from one job
+    // on many cores or many jobs on one core.
+    //
+    // Deliberately *unweighted* - each job counts once regardless of how long it
+    // ran, because the question is about the shape of the jobs rather than about
+    // what the machine was occupied by. The time-weighted answer to the other
+    // question is roughly the `cpu` component's usage over the runtime below.
+    /// Per-user sum of the cores each job was allocated.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_allocated_cpus: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_allocated_cpus when populated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    total_allocated_cpus: u64,
+    /// Per-user sum of the GPUs each job was allocated.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_allocated_gpus: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_allocated_gpus when populated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    total_allocated_gpus: u64,
+
+    // ---- Requeue accounting -------------------------------------------------
+    //
+    // Slurm keeps one accounting record per *attempt* of a job, and a requeued
+    // job has several. The fields above describe only the last attempt of each
+    // job - the one `sacct` returns by default - so that what they report is
+    // unchanged by the arrival of the earlier attempts. Everything the earlier
+    // attempts consumed lands in the fields below instead.
+    //
+    // `total_usage() + total_requeue_usage()` is therefore a project's true
+    // consumption. The split between them is where the charging policy lands:
+    // a superseded attempt the policy charges for is accumulated above with
+    // every other job, and only the attempts the site absorbs are recorded
+    // here. So these fields mean "the consumption we chose not to charge for",
+    // and the charged ones are mirrored in the block below so that they can
+    // still be counted. See `docs/plans/slurm-requeue-accounting-design.md` and
+    // `docs/plans/slurm-requeue-charging-design.md`.
+    //
+    // All are `serde(default)`, so a report from an instance that predates them
+    // deserialises as "no requeues seen" rather than failing.
+    /// Usage from attempts superseded by a requeue, per local user.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    requeue_reports: HashMap<String, Usage>,
+    /// The same, broken down by resource component.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    requeue_components: HashMap<String, HashMap<String, Usage>>,
+    /// Per-user count of requeue *events* (superseded attempts, not jobs).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_requeue_events: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_requeue_events when populated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    num_requeue_events: u64,
+    /// Per-user queue wait accumulated by superseded attempts.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_requeue_wait_seconds: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_requeue_wait_seconds when populated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    requeue_wait_seconds: u64,
+    /// Requeue events by the terminal state of the superseded attempt. Sums to
+    /// `num_requeue_events`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    requeue_states: HashMap<String, u64>,
+    /// Requeue usage by the terminal state of the superseded attempt. Sums to
+    /// `total_requeue_usage()`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    requeue_state_usage: HashMap<String, Usage>,
+
+    // ---- Charged requeues ---------------------------------------------------
+    //
+    // The requeues a project is charged for, which the fields above no longer
+    // hold: a superseded attempt whose terminal state the charging policy
+    // charges is accumulated into `reports` and `components` with every other
+    // job, exactly as though it had never been requeued, and is recorded again
+    // here purely so that it can still be *seen*.
+    //
+    // So these maps describe usage that is already inside `total_usage()`, and
+    // they are the one part of this report that is not disjoint from the rest.
+    // `total_charged_requeue_usage() <= total_usage()` is therefore a bound
+    // rather than an equality, and nothing may add them together. They exist to
+    // answer "how much of this project's requeueing did it pay for, and how
+    // much did the site absorb", which is a question the totals alone cannot
+    // answer once the two are charged differently. See
+    // `docs/plans/slurm-requeue-charging-design.md`.
+    //
+    // All are `serde(default)`: a report from an instance that predates the
+    // charging policy deserialises with them empty, which reads correctly as
+    // "nothing was charged", because under that instance nothing was.
+    /// Usage from superseded attempts that were charged, per local user.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    charged_requeue_reports: HashMap<String, Usage>,
+    /// The same, broken down by resource component.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    charged_requeue_components: HashMap<String, HashMap<String, Usage>>,
+    /// Per-user count of charged requeue *events*.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_charged_requeue_events: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_charged_requeue_events when populated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    num_charged_requeue_events: u64,
+    /// Per-user queue wait accumulated by charged superseded attempts.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    user_charged_requeue_wait_seconds: HashMap<String, u64>,
+    /// Scalar total — equals sum of user_charged_requeue_wait_seconds.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    charged_requeue_wait_seconds: u64,
+    /// Charged requeue events by terminal state. Sums to
+    /// `num_charged_requeue_events`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    charged_requeue_states: HashMap<String, u64>,
+    /// Charged requeue usage by terminal state. Sums to
+    /// `total_charged_requeue_usage()`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    charged_requeue_state_usage: HashMap<String, Usage>,
+
+    // ---- Reservations ------------------------------------------------------
+    //
+    // Which reservation a job ran under, so that a reservation's occupancy can
+    // be seen at all. Jobs outside a reservation - almost all of them - are not
+    // recorded here, so `total_usage_including_requeues()` minus the reservation
+    // total is the unreserved usage.
+    //
+    // These figures deliberately count *every* attempt, superseded ones
+    // included: a requeued attempt held the reservation's nodes exactly as its
+    // replacement did, and for occupancy that is what matters. The superseded
+    // share is carried separately so the two can still be told apart.
+    /// Reservation name → local user → usage consumed inside it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    reservation_reports: HashMap<String, HashMap<String, Usage>>,
+    // Keyed by user as well as by reservation, exactly as `reservation_reports`
+    // is, so that the subset relationship between the two holds entry by entry
+    // rather than only in total. Scaling floors each entry independently, and
+    // flooring is not distributive over a sum: a figure summed from many
+    // entries can land below one summed from few. Keeping the keys identical
+    // means the same divisor floors both sides of every comparison the same
+    // way, and the subset can never overtake the set it belongs to.
+    /// Reservation name → local user → the part of the above from superseded
+    /// attempts.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    reservation_requeue_usage: HashMap<String, HashMap<String, Usage>>,
+    /// Reservation name → jobs that started inside it, counted as `num_jobs` is.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    reservation_jobs: HashMap<String, u64>,
+
+    /// See the note on `reports` above - written even when false, for now.
+    #[serde(default)]
     is_complete: bool,
 }
 
@@ -472,7 +771,44 @@ impl std::fmt::Display for DailyProjectUsageReport {
                 } else {
                     writeln!(f, "Number of jobs: {}", n)?;
                 }
+
+                if self.total_runtime_seconds() > 0 {
+                    writeln!(
+                        f,
+                        "Expansion factor: {:.2} mean per job, {:.2} overall",
+                        self.average_expansion_factor(),
+                        self.aggregate_expansion_factor()
+                    )?;
+                }
+
+                // A real job always holds at least one core, so no cores across
+                // some jobs means the figure was never recorded - a report from
+                // before job sizes were. Saying "0.0 cores" would state a
+                // falsehood rather than admit a gap.
+                if self.average_cpus_per_job() > 0.0 {
+                    writeln!(
+                        f,
+                        "Mean job size: {:.1} cores, {:.1} gpus",
+                        self.average_cpus_per_job(),
+                        self.average_gpus_per_job()
+                    )?;
+                }
             }
+        }
+
+        if self.num_requeue_events() > 0 || !self.total_requeue_usage().is_zero() {
+            writeln!(
+                f,
+                "Requeued: {} {} | {} | Average requeue wait: {}",
+                self.num_requeue_events(),
+                if self.num_requeue_events() == 1 {
+                    "event"
+                } else {
+                    "events"
+                },
+                self.total_requeue_usage(),
+                Usage::new(self.average_requeue_wait_seconds())
+            )?;
         }
 
         match self.is_complete() {
@@ -528,7 +864,44 @@ impl std::fmt::Display for DailyProjectUsageReportHoursDisplay<'_> {
                 } else {
                     writeln!(f, "Number of jobs: {}", n)?;
                 }
+
+                if report.total_runtime_seconds() > 0 {
+                    writeln!(
+                        f,
+                        "Expansion factor: {:.2} mean per job, {:.2} overall",
+                        report.average_expansion_factor(),
+                        report.aggregate_expansion_factor()
+                    )?;
+                }
+
+                // A real job always holds at least one core, so no cores across
+                // some jobs means the figure was never recorded - a report from
+                // before job sizes were. Saying "0.0 cores" would state a
+                // falsehood rather than admit a gap.
+                if report.average_cpus_per_job() > 0.0 {
+                    writeln!(
+                        f,
+                        "Mean job size: {:.1} cores, {:.1} gpus",
+                        report.average_cpus_per_job(),
+                        report.average_gpus_per_job()
+                    )?;
+                }
             }
+        }
+
+        if report.num_requeue_events() > 0 || !report.total_requeue_usage().is_zero() {
+            writeln!(
+                f,
+                "Requeued: {} {} | {} | Average requeue wait: {}",
+                report.num_requeue_events(),
+                if report.num_requeue_events() == 1 {
+                    "event"
+                } else {
+                    "events"
+                },
+                report.total_requeue_usage().in_hours(),
+                Usage::new(report.average_requeue_wait_seconds()).in_hours()
+            )?;
         }
 
         match report.is_complete() {
@@ -590,15 +963,285 @@ impl DailyProjectUsageReport {
     /// Add jobs attributed to a specific user. Updates both the per-user map
     /// and the scalar total so both are always consistent.
     pub fn add_jobs(&mut self, user: &str, count: u64) {
-        *self.user_job_counts.entry(user.to_string()).or_default() += count;
-        self.num_jobs += count;
+        accumulate(&mut self.user_job_counts, user, count);
+        self.num_jobs = self.num_jobs.saturating_add(count);
     }
 
     /// Add wait seconds attributed to a specific user. Updates both the
     /// per-user map and the scalar total.
     pub fn add_wait_seconds(&mut self, user: &str, seconds: u64) {
-        *self.user_wait_seconds.entry(user.to_string()).or_default() += seconds;
+        accumulate(&mut self.user_wait_seconds, user, seconds);
         self.total_wait_seconds = self.total_wait_seconds.saturating_add(seconds);
+    }
+
+    ///
+    /// Record one job's queue time and runtime, for the expansion factor.
+    ///
+    /// Called for the same population as `add_jobs` - one job, once, in the
+    /// window it started in - so that the mean has a well-defined denominator.
+    /// Both figures are properties of the job rather than of the window, so they
+    /// are the job's whole wait and whole runtime even where that runs past the
+    /// window's end.
+    ///
+    /// A job with no runtime is ignored rather than counted as an infinite
+    /// expansion: `op-slurm` does not report jobs that consumed nothing, so this
+    /// should not arise, but a division by zero here would be a process kill.
+    ///
+    pub fn add_expansion(&mut self, user: &str, wait_seconds: u64, runtime_seconds: u64) {
+        if runtime_seconds == 0 {
+            return;
+        }
+
+        // `(wait + run) / run` - the classical expansion factor, so a job that
+        // never waited contributes exactly 1.0
+        let expansion_milli = wait_seconds
+            .saturating_add(runtime_seconds)
+            .saturating_mul(EXPANSION_SCALE)
+            .saturating_div(runtime_seconds);
+
+        accumulate(&mut self.user_expansion_milli, user, expansion_milli);
+        self.total_expansion_milli = self.total_expansion_milli.saturating_add(expansion_milli);
+
+        accumulate(&mut self.user_runtime_seconds, user, runtime_seconds);
+        self.total_runtime_seconds = self.total_runtime_seconds.saturating_add(runtime_seconds);
+
+        accumulate(&mut self.user_expansion_jobs, user, 1);
+        self.num_expansion_jobs = self.num_expansion_jobs.saturating_add(1);
+    }
+
+    ///
+    /// How many jobs the runtime and expansion figures were accumulated over -
+    /// the denominator for every mean derived from them.
+    ///
+    /// Not the same as `num_jobs`: a job still running when the window closed
+    /// has no runtime to record and contributes to one but not the other.
+    /// Falls back to `num_jobs` for a report written before this was counted,
+    /// where the two populations were the same by construction.
+    ///
+    pub fn expansion_jobs(&self) -> u64 {
+        match self.num_expansion_jobs {
+            // Sums but no count is a report written before the count existed,
+            // and there the two populations were the same by construction. No
+            // sums either is a report that genuinely recorded no runtime - the
+            // whole day still running - and it must not borrow a denominator:
+            // averaging nothing over a job count would report a project that
+            // turned everything around instantly.
+            0 if self.total_expansion_milli > 0 || self.total_runtime_seconds > 0 => self.num_jobs,
+            counted => counted,
+        }
+    }
+
+    /// `expansion_jobs` for one local user.
+    pub fn expansion_jobs_for_user(&self, user: &str) -> u64 {
+        match self.user_expansion_jobs.get(user).copied().unwrap_or(0) {
+            0 if self.expansion_milli_for_user(user) > 0
+                || self.runtime_seconds_for_user(user) > 0 =>
+            {
+                self.num_jobs_for_user(user)
+            }
+            counted => counted,
+        }
+    }
+
+    ///
+    /// Record the size of one job: the cores and GPUs it was allocated.
+    ///
+    /// Called for the same population as `add_jobs`, so that dividing by the job
+    /// count gives a mean over exactly the jobs counted. Each job contributes
+    /// once however long it ran - the question is what shape the jobs were, not
+    /// what the machine was busy with.
+    ///
+    pub fn add_job_size(&mut self, user: &str, cpus: u64, gpus: u64) {
+        accumulate(&mut self.user_allocated_cpus, user, cpus);
+        self.total_allocated_cpus = self.total_allocated_cpus.saturating_add(cpus);
+
+        accumulate(&mut self.user_allocated_gpus, user, gpus);
+        self.total_allocated_gpus = self.total_allocated_gpus.saturating_add(gpus);
+    }
+
+    /// The cores allocated to the jobs counted in this report, summed over jobs.
+    /// Useful mainly as the numerator of `average_cpus_per_job`.
+    pub fn total_allocated_cpus(&self) -> u64 {
+        self.total_allocated_cpus
+    }
+
+    /// The GPUs allocated to the jobs counted in this report, summed over jobs.
+    pub fn total_allocated_gpus(&self) -> u64 {
+        self.total_allocated_gpus
+    }
+
+    ///
+    /// The mean number of cores a job was allocated - many small jobs against a
+    /// few large ones.
+    ///
+    /// Each job counts once regardless of how long it ran. This cannot be got
+    /// from usage: the same core-seconds come from one job on many cores or many
+    /// jobs on one core, which is the distinction being drawn here.
+    ///
+    pub fn average_cpus_per_job(&self) -> f64 {
+        match self.num_jobs {
+            0 => 0.0,
+            n => self.total_allocated_cpus as f64 / n as f64,
+        }
+    }
+
+    /// The mean number of GPUs a job was allocated. Zero for a project that ran
+    /// no GPU work, which is itself worth knowing on a GPU machine.
+    pub fn average_gpus_per_job(&self) -> f64 {
+        match self.num_jobs {
+            0 => 0.0,
+            n => self.total_allocated_gpus as f64 / n as f64,
+        }
+    }
+
+    pub fn average_cpus_per_job_for_user(&self, user: &str) -> f64 {
+        match self.num_jobs_for_user(user) {
+            0 => 0.0,
+            n => {
+                let cpus = self.user_allocated_cpus.get(user).copied().unwrap_or(0);
+                cpus as f64 / n as f64
+            }
+        }
+    }
+
+    pub fn average_gpus_per_job_for_user(&self, user: &str) -> f64 {
+        match self.num_jobs_for_user(user) {
+            0 => 0.0,
+            n => {
+                let gpus = self.user_allocated_gpus.get(user).copied().unwrap_or(0);
+                gpus as f64 / n as f64
+            }
+        }
+    }
+
+    pub fn allocated_cpus_for_user(&self, user: &str) -> u64 {
+        self.user_allocated_cpus.get(user).copied().unwrap_or(0)
+    }
+
+    pub fn allocated_gpus_for_user(&self, user: &str) -> u64 {
+        self.user_allocated_gpus.get(user).copied().unwrap_or(0)
+    }
+
+    /// Total wall-clock runtime of the jobs counted in this report. This is not
+    /// usage: usage weights each second by the fraction of a node the job held,
+    /// while this counts the seconds themselves.
+    pub fn total_runtime_seconds(&self) -> u64 {
+        self.total_runtime_seconds
+    }
+
+    /// The summed per-job expansion factors, in thousandths. Exposed so that a
+    /// report spanning several days can compute one mean over every job rather
+    /// than averaging each day's average.
+    pub fn total_expansion_milli(&self) -> u64 {
+        self.total_expansion_milli
+    }
+
+    pub fn expansion_milli_for_user(&self, user: &str) -> u64 {
+        self.user_expansion_milli.get(user).copied().unwrap_or(0)
+    }
+
+    pub fn runtime_seconds_for_user(&self, user: &str) -> u64 {
+        self.user_runtime_seconds.get(user).copied().unwrap_or(0)
+    }
+
+    /// The mean runtime of a job in this report. The figure that makes a wait
+    /// mean something: eleven hours of queueing says one thing beside a job that
+    /// runs for a day and quite another beside one that runs for five minutes.
+    pub fn average_runtime_seconds(&self) -> u64 {
+        match self.expansion_jobs() {
+            0 => 0,
+            n => self.total_runtime_seconds / n,
+        }
+    }
+
+    pub fn average_runtime_seconds_for_user(&self, user: &str) -> u64 {
+        match self.expansion_jobs_for_user(user) {
+            0 => 0,
+            n => self.runtime_seconds_for_user(user) / n,
+        }
+    }
+    ///
+    /// One user's total turnaround over their total runtime - their whole share
+    /// of the report treated as one job, on the same 1.0-is-ideal scale.
+    ///
+    /// Read beside `expansion_factor_for_user`, which is a mean of ratios. The
+    /// gap between the two is the diagnostic: a mean far above this means a
+    /// handful of the user's jobs waited a long time and then exited almost
+    /// immediately, which one figure alone cannot tell apart from a user who
+    /// simply waits.
+    ///
+    pub fn aggregate_expansion_factor_for_user(&self, user: &str) -> f64 {
+        match self.runtime_seconds_for_user(user) {
+            0 => 0.0,
+            runtime => {
+                self.wait_seconds_for_user(user).saturating_add(runtime) as f64 / runtime as f64
+            }
+        }
+    }
+
+    ///
+    /// The mean expansion factor of the jobs counted in this report: turnaround
+    /// over runtime, `(wait + run) / run`, averaged per job.
+    ///
+    /// **1.0 is the ideal** - a job that ran the instant it became eligible -
+    /// and the figure rises with every second spent queueing. A value of 2.0
+    /// means jobs spent as long waiting as running. This is the classical
+    /// definition, as used by `sreport` and the literature.
+    ///
+    /// **0.0 means no jobs**, not a perfect score: it is the empty-report
+    /// sentinel, and no real job can score below 1.0.
+    ///
+    /// Being a mean of ratios, one job that queued for hours and then exited in
+    /// seconds moves this a long way. That is deliberate - it is the signature
+    /// of a user fighting a job that will not run - but it means a single figure
+    /// should be read alongside `aggregate_expansion_factor`, which cannot be
+    /// moved by one short job.
+    ///
+    pub fn average_expansion_factor(&self) -> f64 {
+        match self.expansion_jobs() {
+            0 => 0.0,
+            n => self.total_expansion_milli as f64 / (EXPANSION_SCALE as f64 * n as f64),
+        }
+    }
+
+    /// The mean expansion factor for one user, on the same 1.0-is-ideal scale -
+    /// which is where a struggling user shows up, the project-wide mean having
+    /// averaged them away.
+    pub fn expansion_factor_for_user(&self, user: &str) -> f64 {
+        match self.expansion_jobs_for_user(user) {
+            0 => 0.0,
+            n => {
+                let milli = self.user_expansion_milli.get(user).copied().unwrap_or(0);
+                milli as f64 / (EXPANSION_SCALE as f64 * n as f64)
+            }
+        }
+    }
+
+    ///
+    /// Total turnaround over total runtime - the whole project treated as one
+    /// job. Reads on the same scale as `average_expansion_factor`: 1.0 is
+    /// ideal, 0.0 means no jobs.
+    ///
+    /// The robust companion to `average_expansion_factor`: no single job can
+    /// move it much, which also means it will not show a handful of short jobs
+    /// that waited a long time. Read the two together - a mean far above the
+    /// aggregate says a few short jobs waited a long time, which is usually the
+    /// case worth chasing.
+    ///
+    pub fn aggregate_expansion_factor(&self) -> f64 {
+        match self.total_runtime_seconds {
+            0 => 0.0,
+            runtime => self.total_wait_seconds.saturating_add(runtime) as f64 / runtime as f64,
+        }
+    }
+
+    /// The local users who ran jobs counted in this report. Taken from the job
+    /// counts rather than the usage map, since it is the job count that every
+    /// per-job average divides by.
+    pub fn job_users(&self) -> Vec<String> {
+        let mut users: Vec<String> = self.user_job_counts.keys().cloned().collect();
+        users.sort();
+        users
     }
 
     pub fn num_jobs_for_user(&self, user: &str) -> u64 {
@@ -620,12 +1263,208 @@ impl DailyProjectUsageReport {
     /// Returns true if the scalar totals equal the sums of the per-user maps.
     /// Always true for legacy data (both maps empty, scalars may be non-zero).
     pub fn is_consistent(&self) -> bool {
+        if !self.requeues_are_consistent() {
+            return false;
+        }
+
         if self.user_job_counts.is_empty() && self.user_wait_seconds.is_empty() {
             return true; // legacy data — no maps to check against
         }
-        let jobs_sum: u64 = self.user_job_counts.values().sum();
-        let wait_sum: u64 = self.user_wait_seconds.values().sum();
-        jobs_sum == self.num_jobs && wait_sum == self.total_wait_seconds
+        let jobs_sum = sum_counters(&self.user_job_counts);
+        let wait_sum = sum_counters(&self.user_wait_seconds);
+
+        if jobs_sum != self.num_jobs || wait_sum != self.total_wait_seconds {
+            return false;
+        }
+
+        // The expansion sums are exact integers, so these are equalities rather
+        // than tolerances - which is the point of accumulating thousandths
+        // instead of floats.
+        if !self.user_expansion_milli.is_empty() {
+            let expansion_sum = sum_counters(&self.user_expansion_milli);
+            if expansion_sum != self.total_expansion_milli {
+                return false;
+            }
+        }
+
+        if !self.user_expansion_jobs.is_empty() {
+            let expansion_jobs_sum = sum_counters(&self.user_expansion_jobs);
+            if expansion_jobs_sum != self.num_expansion_jobs {
+                return false;
+            }
+        }
+
+        if !self.user_runtime_seconds.is_empty() {
+            let runtime_sum = sum_counters(&self.user_runtime_seconds);
+            if runtime_sum != self.total_runtime_seconds {
+                return false;
+            }
+        }
+
+        if !self.user_allocated_cpus.is_empty() {
+            let cpu_sum = sum_counters(&self.user_allocated_cpus);
+            if cpu_sum != self.total_allocated_cpus {
+                return false;
+            }
+        }
+
+        if !self.user_allocated_gpus.is_empty() {
+            let gpu_sum = sum_counters(&self.user_allocated_gpus);
+            if gpu_sum != self.total_allocated_gpus {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// How many distinct local users hold usage in any reservation. Only ever
+    /// used as the truncation bound in `is_consistent` above.
+    fn reservation_holders(&self) -> u64 {
+        let mut holders: Vec<&String> = self
+            .reservation_reports
+            .values()
+            .flat_map(|reports| reports.keys())
+            .collect();
+
+        holders.sort();
+        holders.dedup();
+        holders.len() as u64
+    }
+
+    /// The same check for the requeue counters.
+    ///
+    /// Each map is checked only when it is populated. Absent maps are not a
+    /// failure: legacy data has none of them, and a component report from
+    /// `get_component` deliberately carries the requeue usage of one component
+    /// without the per-state breakdown, which describes the whole report and
+    /// cannot be apportioned to a single component.
+    ///
+    /// Where a per-state map *is* present it must account for every event and
+    /// every second of requeue usage - which is why an unrecognised Slurm state
+    /// has to be bucketed rather than dropped.
+    fn requeues_are_consistent(&self) -> bool {
+        if !self.user_requeue_events.is_empty() {
+            let event_sum = sum_counters(&self.user_requeue_events);
+            if event_sum != self.num_requeue_events {
+                return false;
+            }
+        }
+
+        if !self.user_requeue_wait_seconds.is_empty() {
+            let wait_sum = sum_counters(&self.user_requeue_wait_seconds);
+            if wait_sum != self.requeue_wait_seconds {
+                return false;
+            }
+        }
+
+        if !self.requeue_states.is_empty() {
+            let state_sum = sum_counters(&self.requeue_states);
+            if state_sum != self.num_requeue_events {
+                return false;
+            }
+        }
+
+        if !self.requeue_state_usage.is_empty() {
+            let state_usage: Usage = self.requeue_state_usage.values().cloned().sum();
+            if state_usage != self.total_requeue_usage() {
+                return false;
+            }
+        }
+
+        // The charged maps check the same way against their own scalars...
+        if !self.user_charged_requeue_events.is_empty() {
+            let event_sum = sum_counters(&self.user_charged_requeue_events);
+            if event_sum != self.num_charged_requeue_events {
+                return false;
+            }
+        }
+
+        if !self.user_charged_requeue_wait_seconds.is_empty() {
+            let wait_sum = sum_counters(&self.user_charged_requeue_wait_seconds);
+            if wait_sum != self.charged_requeue_wait_seconds {
+                return false;
+            }
+        }
+
+        if !self.charged_requeue_states.is_empty() {
+            let state_sum = sum_counters(&self.charged_requeue_states);
+            if state_sum != self.num_charged_requeue_events {
+                return false;
+            }
+        }
+
+        if !self.charged_requeue_state_usage.is_empty() {
+            let state_usage: Usage = self.charged_requeue_state_usage.values().cloned().sum();
+            if state_usage != self.total_charged_requeue_usage() {
+                return false;
+            }
+        }
+
+        // ...but against the report's own usage they are a *bound*, not an
+        // equality: a charged requeue's usage was accumulated into `reports`
+        // with every other job, so it is part of the total rather than
+        // something to add to it. Exceeding the total would mean it had been
+        // counted somewhere it should not have been.
+        //
+        // The one second of slack per user is truncation, exactly as for the
+        // reservation bound below: dividing the report floors each map's
+        // entries independently, so a figure summed from few entries can land
+        // above one summed from many.
+        if self.total_charged_requeue_usage().seconds()
+            > self
+                .total_usage()
+                .seconds()
+                .saturating_add(self.charged_requeue_reports.len() as u64)
+        {
+            return false;
+        }
+
+        // Entry by entry, for the same reason the reservation check is: a
+        // surplus for one user must not be able to hide under a deficit for
+        // another.
+        for (user, charged) in &self.charged_requeue_reports {
+            if charged.seconds() > self.usage(user).seconds().saturating_add(1) {
+                return false;
+            }
+        }
+
+        // Reservations account for a subset of the day's consumption, not all of
+        // it, so this is a bound rather than an equality - but usage inside
+        // reservations exceeding everything consumed would mean a record had
+        // been counted twice.
+        //
+        // The one second of slack per user is truncation, not tolerance for a
+        // bad report. A reservation figure holds a user's base and requeued
+        // usage together, while the totals hold them apart; dividing the report
+        // floors the two halves separately, so their sum can land a second
+        // below the reservation figure that was floored once. One second per
+        // user holding a reservation is the most that can cost, and it is
+        // nowhere near enough to hide a record that was genuinely counted
+        // twice.
+        if self.total_reservation_usage().seconds()
+            > self
+                .total_usage_including_requeues()
+                .seconds()
+                .saturating_add(self.reservation_holders())
+        {
+            return false;
+        }
+
+        // Entry by entry, because both maps are keyed the same way: a
+        // reservation's requeued share cannot exceed what that same user held
+        // in that same reservation. Comparing only the totals would let a
+        // surplus for one user hide under a deficit for another.
+        for (reservation, reports) in &self.reservation_requeue_usage {
+            for (user, requeued) in reports {
+                if requeued.seconds() > self.reservation_usage_for_user(reservation, user).seconds()
+                {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     pub fn total_wait_seconds(&self) -> u64 {
@@ -671,31 +1510,706 @@ impl DailyProjectUsageReport {
     // the fields that need to change via a clone
     #[allow(clippy::field_reassign_with_default)]
     pub fn get_component(&self, component: &str) -> DailyProjectUsageReport {
-        match self.components.get(component) {
-            Some(reports) => {
-                let mut report = DailyProjectUsageReport::default();
+        let mut report = DailyProjectUsageReport::default();
 
-                for (user, usage) in reports {
-                    report.set_usage(user, *usage);
-                }
-
-                report.user_job_counts = self.user_job_counts.clone();
-                report.user_wait_seconds = self.user_wait_seconds.clone();
-                report.num_jobs = self.num_jobs;
-                report.total_wait_seconds = self.total_wait_seconds;
-                report.is_complete = self.is_complete;
-
-                report
+        if let Some(reports) = self.components.get(component) {
+            for (user, usage) in reports {
+                report.set_usage(user, *usage);
             }
-            None => {
-                let mut report = DailyProjectUsageReport::default();
-                report.user_job_counts = self.user_job_counts.clone();
-                report.user_wait_seconds = self.user_wait_seconds.clone();
-                report.num_jobs = self.num_jobs;
-                report.total_wait_seconds = self.total_wait_seconds;
-                report.is_complete = self.is_complete;
+        }
 
-                report
+        // the requeue usage for the same component, so that a caller asking
+        // for "gpu" gets both the base and the requeue figure for GPUs
+        if let Some(reports) = self.requeue_components.get(component) {
+            report.requeue_reports = reports.clone();
+        }
+
+        // How many jobs ran, how long they queued, how long they ran and how
+        // many cores they held are properties of the *jobs*, not of the
+        // component being sliced out, so they come along unchanged. Leaving
+        // them behind would give a component report a non-zero job count beside
+        // an expansion factor of 0.0 - which this scale defines as "no jobs",
+        // the opposite of the truth.
+        report.user_job_counts = self.user_job_counts.clone();
+        report.user_wait_seconds = self.user_wait_seconds.clone();
+        report.num_jobs = self.num_jobs;
+        report.total_wait_seconds = self.total_wait_seconds;
+
+        report.user_expansion_milli = self.user_expansion_milli.clone();
+        report.total_expansion_milli = self.total_expansion_milli;
+        report.user_runtime_seconds = self.user_runtime_seconds.clone();
+        report.total_runtime_seconds = self.total_runtime_seconds;
+        report.user_expansion_jobs = self.user_expansion_jobs.clone();
+        report.num_expansion_jobs = self.num_expansion_jobs;
+
+        report.user_allocated_cpus = self.user_allocated_cpus.clone();
+        report.total_allocated_cpus = self.total_allocated_cpus;
+        report.user_allocated_gpus = self.user_allocated_gpus.clone();
+        report.total_allocated_gpus = self.total_allocated_gpus;
+
+        report.user_requeue_events = self.user_requeue_events.clone();
+        report.num_requeue_events = self.num_requeue_events;
+        report.user_requeue_wait_seconds = self.user_requeue_wait_seconds.clone();
+        report.requeue_wait_seconds = self.requeue_wait_seconds;
+
+        if let Some(reports) = self.charged_requeue_components.get(component) {
+            report.charged_requeue_reports = reports.clone();
+        }
+
+        report.user_charged_requeue_events = self.user_charged_requeue_events.clone();
+        report.num_charged_requeue_events = self.num_charged_requeue_events;
+        report.user_charged_requeue_wait_seconds = self.user_charged_requeue_wait_seconds.clone();
+        report.charged_requeue_wait_seconds = self.charged_requeue_wait_seconds;
+
+        // The per-state maps are deliberately not copied. They account for the
+        // whole report's requeue events and usage, and there is no way to
+        // apportion them to one component - copying them would leave a report
+        // whose state breakdown claims more usage than the report contains.
+        //
+        // The reservation maps are left behind for the same reason, and this is
+        // a decision rather than an oversight. `reservation_reports` is usage,
+        // which cannot be apportioned to one component; carrying
+        // `reservation_jobs` alone - it being a count, like the job counts above
+        // - would make `reservation_summary` show jobs against no usage at all,
+        // which reads worse than showing nothing.
+
+        report.is_complete = self.is_complete;
+
+        report
+    }
+
+    // ---- Requeue accounting -------------------------------------------------
+
+    /// Usage this user consumed on attempts that were superseded by a requeue.
+    pub fn requeue_usage(&self, local_user: &str) -> Usage {
+        self.requeue_reports
+            .get(local_user)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Total usage consumed on attempts that were superseded by a requeue.
+    pub fn total_requeue_usage(&self) -> Usage {
+        self.requeue_reports.values().cloned().sum()
+    }
+
+    /// A project's true consumption: the usage we have always reported, plus
+    /// the superseded attempts that were previously invisible.
+    pub fn total_usage_including_requeues(&self) -> Usage {
+        self.total_usage() + self.total_requeue_usage()
+    }
+
+    pub fn add_requeue_usage(&mut self, local_user: &str, usage: Usage) {
+        *self
+            .requeue_reports
+            .entry(local_user.to_string())
+            .or_default() += usage;
+    }
+
+    pub fn add_requeue_component_usage(&mut self, component: &str, local_user: &str, usage: Usage) {
+        if usage.is_zero() {
+            return;
+        }
+
+        let component_reports = self
+            .requeue_components
+            .entry(component.to_string())
+            .or_default();
+
+        *component_reports.entry(local_user.to_string()).or_default() += usage;
+    }
+
+    /// Record `count` requeue events for a user, whose superseded attempts
+    /// ended in `state`. The scalar total, the per-user map and the per-state
+    /// map are updated together so they cannot drift apart.
+    pub fn add_requeue_events(&mut self, user: &str, state: &str, count: u64) {
+        accumulate(&mut self.user_requeue_events, user, count);
+        self.num_requeue_events = self.num_requeue_events.saturating_add(count);
+        accumulate(&mut self.requeue_states, state, count);
+    }
+
+    /// Record usage against the terminal state of a superseded attempt. Kept
+    /// separate from `add_requeue_events` because a superseded attempt spanning
+    /// a window boundary has its usage counted in each window it overlaps - the
+    /// part consumed there - while the requeue itself happened at one instant
+    /// and is counted once.
+    pub fn add_requeue_state_usage(&mut self, state: &str, usage: Usage) {
+        if usage.is_zero() {
+            return;
+        }
+
+        *self
+            .requeue_state_usage
+            .entry(state.to_string())
+            .or_default() += usage;
+    }
+
+    pub fn add_requeue_wait_seconds(&mut self, user: &str, seconds: u64) {
+        accumulate(&mut self.user_requeue_wait_seconds, user, seconds);
+        self.requeue_wait_seconds = self.requeue_wait_seconds.saturating_add(seconds);
+    }
+
+    /// The number of requeue *events* - a job requeued four times contributes
+    /// four. Deliberately not a count of jobs affected: an event count is
+    /// additive over any date range, whereas counting distinct jobs would need
+    /// grouping across query windows.
+    pub fn num_requeue_events(&self) -> u64 {
+        self.num_requeue_events
+    }
+
+    pub fn requeue_events_for_user(&self, user: &str) -> u64 {
+        self.user_requeue_events.get(user).copied().unwrap_or(0)
+    }
+
+    /// Queue wait that was discarded by a requeue: the time each superseded
+    /// attempt spent queueing before it ran, only for that run to be thrown
+    /// away. A requeue costs a project both the compute it had done and the
+    /// waiting it had already served, and this is the second of the two.
+    ///
+    /// Measured as `eligible -> start`, so the begin-time hold Slurm imposes
+    /// after a requeue is excluded - Slurm advances `eligible` past it.
+    pub fn requeue_wait_seconds(&self) -> u64 {
+        self.requeue_wait_seconds
+    }
+
+    pub fn requeue_wait_seconds_for_user(&self, user: &str) -> u64 {
+        self.user_requeue_wait_seconds
+            .get(user)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Mean wait per requeue - not per job.
+    pub fn average_requeue_wait_seconds(&self) -> u64 {
+        match self.num_requeue_events {
+            0 => 0,
+            n => self.requeue_wait_seconds / n,
+        }
+    }
+
+    /// Mean total queue wait per job, counting the waits of every attempt.
+    ///
+    /// The two terms do not overlap and neither double counts: a record is
+    /// either a job's last attempt in a window or a superseded one, the last
+    /// attempt's wait is counted in the window it started in, and a superseded
+    /// attempt's wait is counted in the single window that holds its requeue.
+    pub fn average_wait_seconds_including_requeues(&self) -> u64 {
+        match self.num_jobs {
+            0 => 0,
+            n => {
+                self.total_wait_seconds
+                    .saturating_add(self.requeue_wait_seconds)
+                    / n
+            }
+        }
+    }
+
+    /// The terminal states of superseded attempts, with their event counts,
+    /// sorted by state. `NODE_FAIL` is a site problem, `PREEMPTED` a policy the
+    /// project opted into, `CANCELLED` possibly the user's own doing - the flat
+    /// requeue total cannot tell them apart.
+    pub fn requeue_states(&self) -> Vec<(String, u64)> {
+        let mut states: Vec<(String, u64)> = self
+            .requeue_states
+            .iter()
+            .map(|(state, count)| (state.clone(), *count))
+            .collect();
+        states.sort();
+        states
+    }
+
+    pub fn requeue_events_in_state(&self, state: &str) -> u64 {
+        self.requeue_states.get(state).copied().unwrap_or(0)
+    }
+
+    pub fn requeue_usage_in_state(&self, state: &str) -> Usage {
+        self.requeue_state_usage
+            .get(state)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// True if anything about a requeue was recorded for this day.
+    pub fn has_requeues(&self) -> bool {
+        self.num_requeue_events > 0 || !self.total_requeue_usage().is_zero()
+    }
+
+    // ---- Charged requeues ---------------------------------------------------
+    //
+    // Every figure here describes usage that is *already* counted in `reports`
+    // and `components`. Nothing may add it to a total; it is only ever compared
+    // against one. See `docs/plans/slurm-requeue-charging-design.md`.
+
+    /// Usage this user consumed on superseded attempts that were charged.
+    pub fn charged_requeue_usage(&self, local_user: &str) -> Usage {
+        self.charged_requeue_reports
+            .get(local_user)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Total usage from superseded attempts that were charged. A subset of
+    /// `total_usage()`, never an addition to it.
+    pub fn total_charged_requeue_usage(&self) -> Usage {
+        self.charged_requeue_reports.values().cloned().sum()
+    }
+
+    /// All the usage lost to a requeue, charged or not - the figure that
+    /// answers "how much did requeueing cost this project", before the question
+    /// of who pays for it.
+    pub fn total_requeue_usage_including_charged(&self) -> Usage {
+        self.total_requeue_usage() + self.total_charged_requeue_usage()
+    }
+
+    pub fn add_charged_requeue_usage(&mut self, local_user: &str, usage: Usage) {
+        *self
+            .charged_requeue_reports
+            .entry(local_user.to_string())
+            .or_default() += usage;
+    }
+
+    pub fn add_charged_requeue_component_usage(
+        &mut self,
+        component: &str,
+        local_user: &str,
+        usage: Usage,
+    ) {
+        if usage.is_zero() {
+            return;
+        }
+
+        let component_reports = self
+            .charged_requeue_components
+            .entry(component.to_string())
+            .or_default();
+
+        *component_reports.entry(local_user.to_string()).or_default() += usage;
+    }
+
+    /// Record `count` charged requeue events, exactly as `add_requeue_events`
+    /// records absorbed ones.
+    pub fn add_charged_requeue_events(&mut self, user: &str, state: &str, count: u64) {
+        accumulate(&mut self.user_charged_requeue_events, user, count);
+        self.num_charged_requeue_events = self.num_charged_requeue_events.saturating_add(count);
+        accumulate(&mut self.charged_requeue_states, state, count);
+    }
+
+    pub fn add_charged_requeue_state_usage(&mut self, state: &str, usage: Usage) {
+        if usage.is_zero() {
+            return;
+        }
+
+        *self
+            .charged_requeue_state_usage
+            .entry(state.to_string())
+            .or_default() += usage;
+    }
+
+    pub fn add_charged_requeue_wait_seconds(&mut self, user: &str, seconds: u64) {
+        accumulate(&mut self.user_charged_requeue_wait_seconds, user, seconds);
+        self.charged_requeue_wait_seconds =
+            self.charged_requeue_wait_seconds.saturating_add(seconds);
+    }
+
+    /// The number of charged requeue *events* - a job requeued four times and
+    /// charged each time contributes four.
+    pub fn num_charged_requeue_events(&self) -> u64 {
+        self.num_charged_requeue_events
+    }
+
+    pub fn charged_requeue_events_for_user(&self, user: &str) -> u64 {
+        self.user_charged_requeue_events
+            .get(user)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Queue wait discarded by a requeue the project was charged for.
+    pub fn charged_requeue_wait_seconds(&self) -> u64 {
+        self.charged_requeue_wait_seconds
+    }
+
+    pub fn charged_requeue_wait_seconds_for_user(&self, user: &str) -> u64 {
+        self.user_charged_requeue_wait_seconds
+            .get(user)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn charged_requeue_events_in_state(&self, state: &str) -> u64 {
+        self.charged_requeue_states.get(state).copied().unwrap_or(0)
+    }
+
+    pub fn charged_requeue_usage_in_state(&self, state: &str) -> Usage {
+        self.charged_requeue_state_usage
+            .get(state)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The states this report charged for, which is the charging policy as it
+    /// was actually applied rather than as it was configured.
+    pub fn charged_requeue_states(&self) -> Vec<String> {
+        let mut states: Vec<String> = self
+            .charged_requeue_states
+            .keys()
+            .chain(self.charged_requeue_state_usage.keys())
+            .cloned()
+            .collect();
+
+        states.sort();
+        states.dedup();
+        states
+    }
+
+    /// True if any requeue was charged for on this day.
+    pub fn has_charged_requeues(&self) -> bool {
+        self.num_charged_requeue_events > 0 || !self.total_charged_requeue_usage().is_zero()
+    }
+
+    /// The share of this day's requeued consumption that the project was
+    /// charged for, in thousandths - the figure an operator wants when asking
+    /// how much of the requeueing was the site's own doing.
+    ///
+    /// Thousandths rather than a float for the reason given on the expansion
+    /// factor: these reports are merged out of `HashMap`s in arbitrary order,
+    /// and float addition is not associative. `None` when nothing was requeued
+    /// at all, which is not the same as nothing having been charged.
+    pub fn charged_requeue_share_per_mille(&self) -> Option<u64> {
+        let total = self.total_requeue_usage_including_charged().seconds();
+
+        match total {
+            0 => None,
+            total => Some(
+                self.total_charged_requeue_usage()
+                    .seconds()
+                    .saturating_mul(1000)
+                    / total,
+            ),
+        }
+    }
+
+    /// The local users who lost work to a requeue, or whose jobs were requeued.
+    ///
+    /// The two are not the same set: a superseded attempt's usage is recorded in
+    /// every window it overlaps, while the requeue itself is recorded in the one
+    /// window where it happened, so a user can appear in one map and not the
+    /// other. Both are included.
+    pub fn requeue_users(&self) -> Vec<String> {
+        let mut users: Vec<String> = self
+            .requeue_reports
+            .keys()
+            .chain(self.user_requeue_events.keys())
+            .cloned()
+            .collect();
+
+        users.sort();
+        users.dedup();
+        users
+    }
+
+    ///
+    /// Requeue events and usage per interrupting state, worst first.
+    ///
+    /// The counts and the usage come from different rules - see
+    /// `add_requeue_state_usage` - so a state can appear with usage but no
+    /// events, or the other way round. Every state named by either is listed.
+    ///
+    pub fn requeue_state_summary(&self) -> Vec<(String, u64, Usage)> {
+        let mut states: Vec<String> = self
+            .requeue_states
+            .keys()
+            .chain(self.requeue_state_usage.keys())
+            .cloned()
+            .collect();
+
+        states.sort();
+        states.dedup();
+
+        let mut summary: Vec<(String, u64, Usage)> = states
+            .into_iter()
+            .map(|state| {
+                let events = self.requeue_events_in_state(&state);
+                let usage = self.requeue_usage_in_state(&state);
+                (state, events, usage)
+            })
+            .collect();
+
+        // worst first, by usage, with the state name breaking ties so the
+        // ordering is stable
+        summary.sort_by(|a, b| b.2.seconds().cmp(&a.2.seconds()).then(a.0.cmp(&b.0)));
+        summary
+    }
+
+    pub fn requeue_components(&self) -> Vec<String> {
+        let mut components = self.requeue_components.keys().cloned().collect::<Vec<_>>();
+        components.sort();
+        components
+    }
+
+    pub fn requeue_component_usage(&self, component: &str, local_user: &str) -> Usage {
+        self.requeue_components
+            .get(component)
+            .and_then(|reports| reports.get(local_user))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn total_requeue_component_usage(&self, component: &str) -> Usage {
+        match self.requeue_components.get(component) {
+            Some(reports) => reports.values().cloned().sum(),
+            None => Usage::default(),
+        }
+    }
+
+    // ---- Reservations ------------------------------------------------------
+
+    /// Record usage consumed inside a reservation. Called for every attempt,
+    /// superseded ones included - see the field comments.
+    pub fn add_reservation_usage(&mut self, reservation: &str, local_user: &str, usage: Usage) {
+        if reservation.is_empty() || usage.is_zero() {
+            return;
+        }
+
+        let reports = self
+            .reservation_reports
+            .entry(reservation.to_string())
+            .or_default();
+
+        *reports.entry(local_user.to_string()).or_default() += usage;
+    }
+
+    /// Record the part of a reservation's usage that came from an attempt later
+    /// superseded by a requeue. This is a subset of `add_reservation_usage`, not
+    /// an addition to it, so both are called for the same record.
+    pub fn add_reservation_requeue_usage(
+        &mut self,
+        reservation: &str,
+        local_user: &str,
+        usage: Usage,
+    ) {
+        if reservation.is_empty() || usage.is_zero() {
+            return;
+        }
+
+        let reports = self
+            .reservation_requeue_usage
+            .entry(reservation.to_string())
+            .or_default();
+
+        *reports.entry(local_user.to_string()).or_default() += usage;
+    }
+
+    pub fn add_reservation_jobs(&mut self, reservation: &str, count: u64) {
+        if reservation.is_empty() {
+            return;
+        }
+
+        accumulate(&mut self.reservation_jobs, reservation, count);
+    }
+
+    /// The reservations any of this day's jobs ran under, sorted by name.
+    pub fn reservations(&self) -> Vec<String> {
+        let mut reservations: Vec<String> = self
+            .reservation_reports
+            .keys()
+            .chain(self.reservation_jobs.keys())
+            .cloned()
+            .collect();
+
+        reservations.sort();
+        reservations.dedup();
+        reservations
+    }
+
+    pub fn has_reservations(&self) -> bool {
+        !self.reservation_reports.is_empty() || !self.reservation_jobs.is_empty()
+    }
+
+    /// Usage consumed inside `reservation`, counting every attempt.
+    pub fn reservation_usage(&self, reservation: &str) -> Usage {
+        match self.reservation_reports.get(reservation) {
+            Some(reports) => reports.values().cloned().sum(),
+            None => Usage::default(),
+        }
+    }
+
+    pub fn reservation_usage_for_user(&self, reservation: &str, local_user: &str) -> Usage {
+        self.reservation_reports
+            .get(reservation)
+            .and_then(|reports| reports.get(local_user))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The part of `reservation_usage` that was discarded by a requeue.
+    pub fn reservation_requeue_usage(&self, reservation: &str) -> Usage {
+        match self.reservation_requeue_usage.get(reservation) {
+            Some(reports) => reports.values().cloned().sum(),
+            None => Usage::default(),
+        }
+    }
+
+    /// The same for one local user inside that reservation.
+    pub fn reservation_requeue_usage_for_user(&self, reservation: &str, local_user: &str) -> Usage {
+        self.reservation_requeue_usage
+            .get(reservation)
+            .and_then(|reports| reports.get(local_user))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn reservation_jobs(&self, reservation: &str) -> u64 {
+        self.reservation_jobs.get(reservation).copied().unwrap_or(0)
+    }
+
+    pub fn reservation_users(&self, reservation: &str) -> Vec<String> {
+        let mut users: Vec<String> = match self.reservation_reports.get(reservation) {
+            Some(reports) => reports.keys().cloned().collect(),
+            None => Vec::new(),
+        };
+
+        users.sort();
+        users
+    }
+
+    /// Usage consumed inside any reservation, counting every attempt.
+    pub fn total_reservation_usage(&self) -> Usage {
+        self.reservation_reports
+            .values()
+            .map(|reports| reports.values().cloned().sum::<Usage>())
+            .sum()
+    }
+
+    /// Usage consumed outside any reservation. Counts every attempt, so it is
+    /// the complement of `total_reservation_usage` within
+    /// `total_usage_including_requeues`.
+    pub fn usage_outside_reservations(&self) -> Usage {
+        self.total_usage_including_requeues() - self.total_reservation_usage()
+    }
+
+    /// Jobs, usage and discarded share per reservation, busiest first.
+    pub fn reservation_summary(&self) -> Vec<(String, u64, Usage, Usage)> {
+        let mut summary: Vec<(String, u64, Usage, Usage)> = self
+            .reservations()
+            .into_iter()
+            .map(|reservation| {
+                let jobs = self.reservation_jobs(&reservation);
+                let usage = self.reservation_usage(&reservation);
+                let requeued = self.reservation_requeue_usage(&reservation);
+                (reservation, jobs, usage, requeued)
+            })
+            .collect();
+
+        summary.sort_by(|a, b| b.2.seconds().cmp(&a.2.seconds()).then(a.0.cmp(&b.0)));
+        summary
+    }
+
+    /// Scale the usage totals - base and requeue together. The two must always
+    /// be scaled by the same factor, or `total_usage()` and
+    /// `total_requeue_usage()` end up in different units and the sum a client
+    /// makes of them is meaningless.
+    ///
+    /// Job counts, wait times, runtimes, expansion factors and job sizes are
+    /// deliberately untouched by every scaling operation on this type. A credit
+    /// conversion rescales usage; it does not change how many jobs ran, how long
+    /// they queued, how many cores they held, or a dimensionless ratio.
+    fn scale_totals(&mut self, factor: f64) {
+        for usage in self.reports.values_mut() {
+            *usage *= factor;
+        }
+        for usage in self.requeue_reports.values_mut() {
+            *usage *= factor;
+        }
+        for usage in self.requeue_state_usage.values_mut() {
+            *usage *= factor;
+        }
+        // The charged maps describe a subset of `reports`, so they must scale
+        // with it or the share they represent changes with the currency.
+        for usage in self.charged_requeue_reports.values_mut() {
+            *usage *= factor;
+        }
+        for usage in self.charged_requeue_state_usage.values_mut() {
+            *usage *= factor;
+        }
+        for reports in self.reservation_reports.values_mut() {
+            for usage in reports.values_mut() {
+                *usage *= factor;
+            }
+        }
+        for reports in self.reservation_requeue_usage.values_mut() {
+            for usage in reports.values_mut() {
+                *usage *= factor;
+            }
+        }
+    }
+
+    /// Scale the component breakdowns - base and requeue together, for the
+    /// same reason as `scale_totals`.
+    fn scale_components(&mut self, factor: f64) {
+        for component_reports in self.components.values_mut() {
+            for usage in component_reports.values_mut() {
+                *usage *= factor;
+            }
+        }
+        for component_reports in self.requeue_components.values_mut() {
+            for usage in component_reports.values_mut() {
+                *usage *= factor;
+            }
+        }
+        for component_reports in self.charged_requeue_components.values_mut() {
+            for usage in component_reports.values_mut() {
+                *usage *= factor;
+            }
+        }
+    }
+
+    /// `scale_totals`, dividing. Spelled out rather than multiplying by a
+    /// reciprocal: `Usage` truncates to whole seconds, so `3 / 3.0` and
+    /// `3 * (1.0 / 3.0)` do not agree.
+    fn divide_totals(&mut self, divisor: f64) {
+        for usage in self.reports.values_mut() {
+            *usage /= divisor;
+        }
+        for usage in self.requeue_reports.values_mut() {
+            *usage /= divisor;
+        }
+        for usage in self.requeue_state_usage.values_mut() {
+            *usage /= divisor;
+        }
+        for usage in self.charged_requeue_reports.values_mut() {
+            *usage /= divisor;
+        }
+        for usage in self.charged_requeue_state_usage.values_mut() {
+            *usage /= divisor;
+        }
+        for reports in self.reservation_reports.values_mut() {
+            for usage in reports.values_mut() {
+                *usage /= divisor;
+            }
+        }
+        for reports in self.reservation_requeue_usage.values_mut() {
+            for usage in reports.values_mut() {
+                *usage /= divisor;
+            }
+        }
+    }
+
+    /// `scale_components`, dividing.
+    fn divide_components(&mut self, divisor: f64) {
+        for component_reports in self.components.values_mut() {
+            for usage in component_reports.values_mut() {
+                *usage /= divisor;
+            }
+        }
+        for component_reports in self.requeue_components.values_mut() {
+            for usage in component_reports.values_mut() {
+                *usage /= divisor;
+            }
+        }
+        for component_reports in self.charged_requeue_components.values_mut() {
+            for usage in component_reports.values_mut() {
+                *usage /= divisor;
             }
         }
     }
@@ -710,48 +2224,68 @@ impl DailyProjectUsageReport {
 
     /// Remap local username strings using a pre-built old → new map.
     /// Any username not present in `string_map` is left unchanged.
+    ///
+    /// Two old names can map onto one new one - that is what a rename that
+    /// consolidates two local accounts looks like - so every map here is merged
+    /// rather than rebuilt with `collect`, which keeps whichever entry the
+    /// iterator happened to yield last and silently drops the other.
     pub(crate) fn remap_local_users(&mut self, string_map: &HashMap<String, String>) {
-        let old_reports = std::mem::take(&mut self.reports);
-        self.reports = old_reports
-            .into_iter()
-            .map(|(user, usage)| {
-                let new_user = string_map.get(&user).cloned().unwrap_or(user);
-                (new_user, usage)
-            })
-            .collect();
+        self.reports = remap_usages(std::mem::take(&mut self.reports), string_map);
+        self.components = remap_nested_usages(std::mem::take(&mut self.components), string_map);
 
-        let old_components = std::mem::take(&mut self.components);
-        self.components = old_components
-            .into_iter()
-            .map(|(component, user_map)| {
-                let new_user_map = user_map
-                    .into_iter()
-                    .map(|(user, usage)| {
-                        let new_user = string_map.get(&user).cloned().unwrap_or(user);
-                        (new_user, usage)
-                    })
-                    .collect();
-                (component, new_user_map)
-            })
-            .collect();
+        self.user_job_counts =
+            remap_counters(std::mem::take(&mut self.user_job_counts), string_map);
+        self.user_wait_seconds =
+            remap_counters(std::mem::take(&mut self.user_wait_seconds), string_map);
+        self.user_expansion_milli =
+            remap_counters(std::mem::take(&mut self.user_expansion_milli), string_map);
+        self.user_runtime_seconds =
+            remap_counters(std::mem::take(&mut self.user_runtime_seconds), string_map);
+        self.user_expansion_jobs =
+            remap_counters(std::mem::take(&mut self.user_expansion_jobs), string_map);
+        self.user_allocated_cpus =
+            remap_counters(std::mem::take(&mut self.user_allocated_cpus), string_map);
+        self.user_allocated_gpus =
+            remap_counters(std::mem::take(&mut self.user_allocated_gpus), string_map);
 
-        let old_counts = std::mem::take(&mut self.user_job_counts);
-        self.user_job_counts = old_counts
-            .into_iter()
-            .map(|(user, count)| {
-                let new_user = string_map.get(&user).cloned().unwrap_or(user);
-                (new_user, count)
-            })
-            .collect();
+        // The requeue maps are keyed the same way and need the same treatment.
+        // `requeue_states` and `requeue_state_usage` are keyed by Slurm state
+        // rather than by user, so they are deliberately left alone.
+        self.requeue_reports = remap_usages(std::mem::take(&mut self.requeue_reports), string_map);
+        self.requeue_components =
+            remap_nested_usages(std::mem::take(&mut self.requeue_components), string_map);
+        self.user_requeue_events =
+            remap_counters(std::mem::take(&mut self.user_requeue_events), string_map);
+        self.user_requeue_wait_seconds = remap_counters(
+            std::mem::take(&mut self.user_requeue_wait_seconds),
+            string_map,
+        );
 
-        let old_waits = std::mem::take(&mut self.user_wait_seconds);
-        self.user_wait_seconds = old_waits
-            .into_iter()
-            .map(|(user, secs)| {
-                let new_user = string_map.get(&user).cloned().unwrap_or(user);
-                (new_user, secs)
-            })
-            .collect();
+        // The charged maps are keyed by user in the same way, and by Slurm
+        // state, which is not a user name and is left alone.
+        self.charged_requeue_reports = remap_usages(
+            std::mem::take(&mut self.charged_requeue_reports),
+            string_map,
+        );
+        self.charged_requeue_components = remap_nested_usages(
+            std::mem::take(&mut self.charged_requeue_components),
+            string_map,
+        );
+        self.user_charged_requeue_events = remap_counters(
+            std::mem::take(&mut self.user_charged_requeue_events),
+            string_map,
+        );
+        self.user_charged_requeue_wait_seconds = remap_counters(
+            std::mem::take(&mut self.user_charged_requeue_wait_seconds),
+            string_map,
+        );
+
+        self.reservation_reports =
+            remap_nested_usages(std::mem::take(&mut self.reservation_reports), string_map);
+        self.reservation_requeue_usage = remap_nested_usages(
+            std::mem::take(&mut self.reservation_requeue_usage),
+            string_map,
+        );
     }
 }
 
@@ -773,16 +2307,121 @@ impl std::ops::Add<DailyProjectUsageReport> for DailyProjectUsageReport {
         }
 
         for (user, count) in &other.user_job_counts {
-            *new_report.user_job_counts.entry(user.clone()).or_default() += count;
+            accumulate(&mut new_report.user_job_counts, user, *count);
         }
         for (user, secs) in &other.user_wait_seconds {
-            *new_report
-                .user_wait_seconds
-                .entry(user.clone())
-                .or_default() += secs;
+            accumulate(&mut new_report.user_wait_seconds, user, *secs);
         }
-        new_report.num_jobs = self.num_jobs + other.num_jobs;
-        new_report.total_wait_seconds = self.total_wait_seconds + other.total_wait_seconds;
+        // Saturating: these totals are summed from peer-supplied reports, and
+        // `overflow-checks` is on in release, so a bare `+` is a process kill.
+        new_report.num_jobs = self.num_jobs.saturating_add(other.num_jobs);
+        new_report.total_wait_seconds = self
+            .total_wait_seconds
+            .saturating_add(other.total_wait_seconds);
+
+        for (user, milli) in &other.user_expansion_milli {
+            accumulate(&mut new_report.user_expansion_milli, user, *milli);
+        }
+        for (user, secs) in &other.user_runtime_seconds {
+            accumulate(&mut new_report.user_runtime_seconds, user, *secs);
+        }
+        for (user, jobs) in &other.user_expansion_jobs {
+            accumulate(&mut new_report.user_expansion_jobs, user, *jobs);
+        }
+        new_report.total_expansion_milli = self
+            .total_expansion_milli
+            .saturating_add(other.total_expansion_milli);
+        new_report.total_runtime_seconds = self
+            .total_runtime_seconds
+            .saturating_add(other.total_runtime_seconds);
+        new_report.num_expansion_jobs = self
+            .num_expansion_jobs
+            .saturating_add(other.num_expansion_jobs);
+
+        for (user, cpus) in &other.user_allocated_cpus {
+            accumulate(&mut new_report.user_allocated_cpus, user, *cpus);
+        }
+        for (user, gpus) in &other.user_allocated_gpus {
+            accumulate(&mut new_report.user_allocated_gpus, user, *gpus);
+        }
+        new_report.total_allocated_cpus = self
+            .total_allocated_cpus
+            .saturating_add(other.total_allocated_cpus);
+        new_report.total_allocated_gpus = self
+            .total_allocated_gpus
+            .saturating_add(other.total_allocated_gpus);
+
+        for (user, usage) in other.requeue_reports {
+            new_report.add_requeue_usage(&user, usage);
+        }
+        for (component, reports) in other.requeue_components {
+            for (user, usage) in reports {
+                new_report.add_requeue_component_usage(&component, &user, usage);
+            }
+        }
+        for (user, count) in &other.user_requeue_events {
+            accumulate(&mut new_report.user_requeue_events, user, *count);
+        }
+        for (user, secs) in &other.user_requeue_wait_seconds {
+            accumulate(&mut new_report.user_requeue_wait_seconds, user, *secs);
+        }
+        for (state, count) in &other.requeue_states {
+            accumulate(&mut new_report.requeue_states, state, *count);
+        }
+        for (state, usage) in other.requeue_state_usage {
+            new_report.add_requeue_state_usage(&state, usage);
+        }
+        new_report.num_requeue_events = self
+            .num_requeue_events
+            .saturating_add(other.num_requeue_events);
+        new_report.requeue_wait_seconds = self
+            .requeue_wait_seconds
+            .saturating_add(other.requeue_wait_seconds);
+
+        for (user, usage) in other.charged_requeue_reports {
+            new_report.add_charged_requeue_usage(&user, usage);
+        }
+        for (component, reports) in other.charged_requeue_components {
+            for (user, usage) in reports {
+                new_report.add_charged_requeue_component_usage(&component, &user, usage);
+            }
+        }
+        for (user, count) in &other.user_charged_requeue_events {
+            accumulate(&mut new_report.user_charged_requeue_events, user, *count);
+        }
+        for (user, secs) in &other.user_charged_requeue_wait_seconds {
+            accumulate(
+                &mut new_report.user_charged_requeue_wait_seconds,
+                user,
+                *secs,
+            );
+        }
+        for (state, count) in &other.charged_requeue_states {
+            accumulate(&mut new_report.charged_requeue_states, state, *count);
+        }
+        for (state, usage) in other.charged_requeue_state_usage {
+            new_report.add_charged_requeue_state_usage(&state, usage);
+        }
+        new_report.num_charged_requeue_events = self
+            .num_charged_requeue_events
+            .saturating_add(other.num_charged_requeue_events);
+        new_report.charged_requeue_wait_seconds = self
+            .charged_requeue_wait_seconds
+            .saturating_add(other.charged_requeue_wait_seconds);
+
+        for (reservation, reports) in other.reservation_reports {
+            for (user, usage) in reports {
+                new_report.add_reservation_usage(&reservation, &user, usage);
+            }
+        }
+        for (reservation, reports) in other.reservation_requeue_usage {
+            for (user, usage) in reports {
+                new_report.add_reservation_requeue_usage(&reservation, &user, usage);
+            }
+        }
+        for (reservation, count) in &other.reservation_jobs {
+            new_report.add_reservation_jobs(reservation, *count);
+        }
 
         new_report.is_complete = false; // combine reports are never complete
 
@@ -804,15 +2443,115 @@ impl std::ops::AddAssign<DailyProjectUsageReport> for DailyProjectUsageReport {
         }
 
         for (user, count) in &other.user_job_counts {
-            *self.user_job_counts.entry(user.clone()).or_default() += count;
+            accumulate(&mut self.user_job_counts, user, *count);
         }
         for (user, secs) in &other.user_wait_seconds {
-            *self.user_wait_seconds.entry(user.clone()).or_default() += secs;
+            accumulate(&mut self.user_wait_seconds, user, *secs);
         }
-        self.num_jobs += other.num_jobs;
+        self.num_jobs = self.num_jobs.saturating_add(other.num_jobs);
         self.total_wait_seconds = self
             .total_wait_seconds
             .saturating_add(other.total_wait_seconds);
+
+        for (user, milli) in &other.user_expansion_milli {
+            accumulate(&mut self.user_expansion_milli, user, *milli);
+        }
+        for (user, secs) in &other.user_runtime_seconds {
+            accumulate(&mut self.user_runtime_seconds, user, *secs);
+        }
+        for (user, jobs) in &other.user_expansion_jobs {
+            accumulate(&mut self.user_expansion_jobs, user, *jobs);
+        }
+        self.total_expansion_milli = self
+            .total_expansion_milli
+            .saturating_add(other.total_expansion_milli);
+        self.total_runtime_seconds = self
+            .total_runtime_seconds
+            .saturating_add(other.total_runtime_seconds);
+        self.num_expansion_jobs = self
+            .num_expansion_jobs
+            .saturating_add(other.num_expansion_jobs);
+
+        for (user, cpus) in &other.user_allocated_cpus {
+            accumulate(&mut self.user_allocated_cpus, user, *cpus);
+        }
+        for (user, gpus) in &other.user_allocated_gpus {
+            accumulate(&mut self.user_allocated_gpus, user, *gpus);
+        }
+        self.total_allocated_cpus = self
+            .total_allocated_cpus
+            .saturating_add(other.total_allocated_cpus);
+        self.total_allocated_gpus = self
+            .total_allocated_gpus
+            .saturating_add(other.total_allocated_gpus);
+
+        for (user, usage) in other.requeue_reports {
+            self.add_requeue_usage(&user, usage);
+        }
+        for (component, reports) in other.requeue_components {
+            for (user, usage) in reports {
+                self.add_requeue_component_usage(&component, &user, usage);
+            }
+        }
+        for (user, count) in &other.user_requeue_events {
+            accumulate(&mut self.user_requeue_events, user, *count);
+        }
+        for (user, secs) in &other.user_requeue_wait_seconds {
+            accumulate(&mut self.user_requeue_wait_seconds, user, *secs);
+        }
+        for (state, count) in &other.requeue_states {
+            accumulate(&mut self.requeue_states, state, *count);
+        }
+        for (state, usage) in other.requeue_state_usage {
+            self.add_requeue_state_usage(&state, usage);
+        }
+        self.num_requeue_events = self
+            .num_requeue_events
+            .saturating_add(other.num_requeue_events);
+        self.requeue_wait_seconds = self
+            .requeue_wait_seconds
+            .saturating_add(other.requeue_wait_seconds);
+
+        for (user, usage) in other.charged_requeue_reports {
+            self.add_charged_requeue_usage(&user, usage);
+        }
+        for (component, reports) in other.charged_requeue_components {
+            for (user, usage) in reports {
+                self.add_charged_requeue_component_usage(&component, &user, usage);
+            }
+        }
+        for (user, count) in &other.user_charged_requeue_events {
+            accumulate(&mut self.user_charged_requeue_events, user, *count);
+        }
+        for (user, secs) in &other.user_charged_requeue_wait_seconds {
+            accumulate(&mut self.user_charged_requeue_wait_seconds, user, *secs);
+        }
+        for (state, count) in &other.charged_requeue_states {
+            accumulate(&mut self.charged_requeue_states, state, *count);
+        }
+        for (state, usage) in other.charged_requeue_state_usage {
+            self.add_charged_requeue_state_usage(&state, usage);
+        }
+        self.num_charged_requeue_events = self
+            .num_charged_requeue_events
+            .saturating_add(other.num_charged_requeue_events);
+        self.charged_requeue_wait_seconds = self
+            .charged_requeue_wait_seconds
+            .saturating_add(other.charged_requeue_wait_seconds);
+
+        for (reservation, reports) in other.reservation_reports {
+            for (user, usage) in reports {
+                self.add_reservation_usage(&reservation, &user, usage);
+            }
+        }
+        for (reservation, reports) in other.reservation_requeue_usage {
+            for (user, usage) in reports {
+                self.add_reservation_requeue_usage(&reservation, &user, usage);
+            }
+        }
+        for (reservation, count) in &other.reservation_jobs {
+            self.add_reservation_jobs(reservation, *count);
+        }
 
         self.is_complete = false; // combine reports are never complete
     }
@@ -823,17 +2562,8 @@ impl std::ops::Mul<f64> for DailyProjectUsageReport {
 
     fn mul(self, rhs: f64) -> Self {
         let mut new_report = self.clone();
-        for usage in new_report.reports.values_mut() {
-            *usage *= rhs;
-        }
-
-        // do the same for the component usage
-        for component_reports in new_report.components.values_mut() {
-            for usage in component_reports.values_mut() {
-                *usage *= rhs;
-            }
-        }
-
+        new_report.scale_totals(rhs);
+        new_report.scale_components(rhs);
         new_report
     }
 }
@@ -843,34 +2573,30 @@ impl std::ops::Div<f64> for DailyProjectUsageReport {
 
     fn div(self, rhs: f64) -> Self {
         let mut new_report = self.clone();
-        for usage in new_report.reports.values_mut() {
-            *usage /= rhs;
-        }
-
-        // do the same for the component usage
-        for component_reports in new_report.components.values_mut() {
-            for usage in component_reports.values_mut() {
-                *usage /= rhs;
-            }
-        }
-
+        new_report.divide_totals(rhs);
+        new_report.divide_components(rhs);
         new_report
     }
 }
 
+// `*=` scales the component breakdowns alongside the totals, exactly as `*`
+// does. It did not, and neither did `/=`, so `report *= 2.0` doubled a day's
+// usage while leaving the breakdown of that usage at its old value - the parts
+// no longer summed to the whole, and which of the two a caller saw depended on
+// whether it had written `a = a * f` or `a *= f`. Anything that genuinely wants
+// to scale only the totals has `ProjectUsageReport::scale_total`, which says so
+// in its name.
 impl std::ops::MulAssign<f64> for DailyProjectUsageReport {
     fn mul_assign(&mut self, rhs: f64) {
-        for usage in self.reports.values_mut() {
-            *usage *= rhs;
-        }
+        self.scale_totals(rhs);
+        self.scale_components(rhs);
     }
 }
 
 impl std::ops::DivAssign<f64> for DailyProjectUsageReport {
     fn div_assign(&mut self, rhs: f64) {
-        for usage in self.reports.values_mut() {
-            *usage /= rhs;
-        }
+        self.divide_totals(rhs);
+        self.divide_components(rhs);
     }
 }
 
@@ -881,6 +2607,9 @@ pub struct ProjectUsageReport {
     project: ProjectIdentifier,
     #[ts(as = "HashMap<String, DailyProjectUsageReport>")]
     reports: HashMap<Date, DailyProjectUsageReport>,
+    /// See the note on `DailyProjectUsageReport::reports` - written even when
+    /// empty, because release 0.92.0 cannot read a report without it.
+    #[serde(default)]
     #[ts(as = "HashMap<String, String>")]
     users: HashMap<UserIdentifier, String>,
 }
@@ -902,8 +2631,9 @@ impl std::fmt::Display for ProjectUsageReport {
         for date in dates {
             let report = self.reports.get(date).cloned().unwrap_or_default();
 
-            if report.total_usage() == Usage::default() {
-                // skip days with no usage
+            if report.total_usage() == Usage::default() && !report.has_requeues() {
+                // skip days with no usage - but a day whose whole consumption
+                // was discarded by requeues has plenty to say
                 continue;
             }
 
@@ -944,6 +2674,54 @@ impl std::fmt::Display for ProjectUsageReport {
                     } else {
                         writeln!(f, "Number of jobs: {}", n)?;
                     }
+
+                    if report.total_runtime_seconds() > 0 {
+                        writeln!(
+                            f,
+                            "Expansion factor: {:.2} mean per job, {:.2} overall",
+                            report.average_expansion_factor(),
+                            report.aggregate_expansion_factor()
+                        )?;
+                    }
+
+                    // A real job always holds at least one core, so no cores across
+                    // some jobs means the figure was never recorded - a report from
+                    // before job sizes were. Saying "0.0 cores" would state a
+                    // falsehood rather than admit a gap.
+                    if report.average_cpus_per_job() > 0.0 {
+                        writeln!(
+                            f,
+                            "Mean job size: {:.1} cores, {:.1} gpus",
+                            report.average_cpus_per_job(),
+                            report.average_gpus_per_job()
+                        )?;
+                    }
+                }
+            }
+            if report.has_requeues() {
+                writeln!(
+                    f,
+                    "Requeued: {} {} | {} | Average requeue wait: {}",
+                    report.num_requeue_events(),
+                    if report.num_requeue_events() == 1 {
+                        "event"
+                    } else {
+                        "events"
+                    },
+                    report.total_requeue_usage(),
+                    Usage::new(report.average_requeue_wait_seconds())
+                )?;
+            }
+            if report.has_reservations() {
+                for (reservation, jobs, usage, _) in report.reservation_summary() {
+                    writeln!(
+                        f,
+                        "Reservation {}: {} | {} {}",
+                        reservation,
+                        usage,
+                        jobs,
+                        if jobs == 1 { "job" } else { "jobs" }
+                    )?;
                 }
             }
             writeln!(f, "Daily total: {}", report.total_usage())?;
@@ -964,8 +2742,53 @@ impl std::fmt::Display for ProjectUsageReport {
                 } else {
                     writeln!(f, "Number of jobs: {}", n)?;
                 }
+
+                if self.total_runtime_seconds() > 0 {
+                    writeln!(
+                        f,
+                        "Expansion factor: {:.2} mean per job, {:.2} overall",
+                        self.average_expansion_factor(),
+                        self.aggregate_expansion_factor()
+                    )?;
+                }
+
+                // A real job always holds at least one core, so no cores across
+                // some jobs means the figure was never recorded - a report from
+                // before job sizes were. Saying "0.0 cores" would state a
+                // falsehood rather than admit a gap.
+                if self.average_cpus_per_job() > 0.0 {
+                    writeln!(
+                        f,
+                        "Mean job size: {:.1} cores, {:.1} gpus",
+                        self.average_cpus_per_job(),
+                        self.average_gpus_per_job()
+                    )?;
+                }
             }
         }
+        if self.num_requeue_events() > 0 || !self.total_requeue_usage().is_zero() {
+            writeln!(
+                f,
+                "Requeued: {} {} | {} | Average requeue wait: {}",
+                self.num_requeue_events(),
+                if self.num_requeue_events() == 1 {
+                    "event"
+                } else {
+                    "events"
+                },
+                self.total_requeue_usage(),
+                Usage::new(self.average_requeue_wait_seconds())
+            )?;
+        }
+        if self.has_reservations() {
+            writeln!(
+                f,
+                "In reservations: {} across {}",
+                self.total_reservation_usage(),
+                self.reservations().join(", ")
+            )?;
+        }
+
         writeln!(f, "Total: {}", self.total_usage())
     }
 }
@@ -991,7 +2814,8 @@ impl std::fmt::Display for ProjectUsageReportHoursDisplay<'_> {
         for date in dates {
             let daily = report.reports.get(date).cloned().unwrap_or_default();
 
-            if daily.total_usage() == Usage::default() {
+            if daily.total_usage() == Usage::default() && !daily.has_requeues() {
+                // see the note in the `Display` impl above
                 continue;
             }
 
@@ -1032,6 +2856,54 @@ impl std::fmt::Display for ProjectUsageReportHoursDisplay<'_> {
                     } else {
                         writeln!(f, "Number of jobs: {}", n)?;
                     }
+
+                    if daily.total_runtime_seconds() > 0 {
+                        writeln!(
+                            f,
+                            "Expansion factor: {:.2} mean per job, {:.2} overall",
+                            daily.average_expansion_factor(),
+                            daily.aggregate_expansion_factor()
+                        )?;
+                    }
+
+                    // A real job always holds at least one core, so no cores across
+                    // some jobs means the figure was never recorded - a report from
+                    // before job sizes were. Saying "0.0 cores" would state a
+                    // falsehood rather than admit a gap.
+                    if daily.average_cpus_per_job() > 0.0 {
+                        writeln!(
+                            f,
+                            "Mean job size: {:.1} cores, {:.1} gpus",
+                            daily.average_cpus_per_job(),
+                            daily.average_gpus_per_job()
+                        )?;
+                    }
+                }
+            }
+            if daily.has_requeues() {
+                writeln!(
+                    f,
+                    "Requeued: {} {} | {} | Average requeue wait: {}",
+                    daily.num_requeue_events(),
+                    if daily.num_requeue_events() == 1 {
+                        "event"
+                    } else {
+                        "events"
+                    },
+                    daily.total_requeue_usage().in_hours(),
+                    Usage::new(daily.average_requeue_wait_seconds()).in_hours()
+                )?;
+            }
+            if daily.has_reservations() {
+                for (reservation, jobs, usage, _) in daily.reservation_summary() {
+                    writeln!(
+                        f,
+                        "Reservation {}: {} | {} {}",
+                        reservation,
+                        usage.in_hours(),
+                        jobs,
+                        if jobs == 1 { "job" } else { "jobs" }
+                    )?;
                 }
             }
             writeln!(f, "Daily total: {}", daily.total_usage().in_hours())?;
@@ -1052,8 +2924,53 @@ impl std::fmt::Display for ProjectUsageReportHoursDisplay<'_> {
                 } else {
                     writeln!(f, "Number of jobs: {}", n)?;
                 }
+
+                if report.total_runtime_seconds() > 0 {
+                    writeln!(
+                        f,
+                        "Expansion factor: {:.2} mean per job, {:.2} overall",
+                        report.average_expansion_factor(),
+                        report.aggregate_expansion_factor()
+                    )?;
+                }
+
+                // A real job always holds at least one core, so no cores across
+                // some jobs means the figure was never recorded - a report from
+                // before job sizes were. Saying "0.0 cores" would state a
+                // falsehood rather than admit a gap.
+                if report.average_cpus_per_job() > 0.0 {
+                    writeln!(
+                        f,
+                        "Mean job size: {:.1} cores, {:.1} gpus",
+                        report.average_cpus_per_job(),
+                        report.average_gpus_per_job()
+                    )?;
+                }
             }
         }
+        if report.num_requeue_events() > 0 || !report.total_requeue_usage().is_zero() {
+            writeln!(
+                f,
+                "Requeued: {} {} | {} | Average requeue wait: {}",
+                report.num_requeue_events(),
+                if report.num_requeue_events() == 1 {
+                    "event"
+                } else {
+                    "events"
+                },
+                report.total_requeue_usage().in_hours(),
+                Usage::new(report.average_requeue_wait_seconds()).in_hours()
+            )?;
+        }
+        if report.has_reservations() {
+            writeln!(
+                f,
+                "In reservations: {} across {}",
+                report.total_reservation_usage().in_hours(),
+                report.reservations().join(", ")
+            )?;
+        }
+
         writeln!(f, "Total: {}", report.total_usage().in_hours())
     }
 }
@@ -1116,21 +3033,20 @@ impl std::ops::AddAssign<ProjectUsageReport> for ProjectUsageReport {
     }
 }
 
+// Scaling a project's report is scaling each of its days, so these delegate
+// rather than reaching into a day's fields themselves. They used to reach in,
+// and reached only `reports` and `components` - so a project report scaled with
+// `*` kept its requeue and reservation figures at their old values while the
+// usage beside them moved, leaving `total_usage_including_requeues` adding two
+// different units together. `DailyProjectUsageReport`'s own operators have
+// always scaled base and requeue together, and now there is only one copy of
+// that decision.
 impl std::ops::Mul<f64> for ProjectUsageReport {
     type Output = Self;
 
     fn mul(self, rhs: f64) -> Self {
         let mut new_report = self.clone();
-        for report in new_report.reports.values_mut() {
-            for usage in report.reports.values_mut() {
-                *usage *= rhs;
-            }
-            for component_reports in report.components.values_mut() {
-                for usage in component_reports.values_mut() {
-                    *usage *= rhs;
-                }
-            }
-        }
+        new_report *= rhs;
         new_report
     }
 }
@@ -1140,16 +3056,7 @@ impl std::ops::Div<f64> for ProjectUsageReport {
 
     fn div(self, rhs: f64) -> Self {
         let mut new_report = self.clone();
-        for report in new_report.reports.values_mut() {
-            for usage in report.reports.values_mut() {
-                *usage /= rhs;
-            }
-            for component_reports in report.components.values_mut() {
-                for usage in component_reports.values_mut() {
-                    *usage /= rhs;
-                }
-            }
-        }
+        new_report /= rhs;
         new_report
     }
 }
@@ -1157,14 +3064,7 @@ impl std::ops::Div<f64> for ProjectUsageReport {
 impl std::ops::MulAssign<f64> for ProjectUsageReport {
     fn mul_assign(&mut self, rhs: f64) {
         for report in self.reports.values_mut() {
-            for usage in report.reports.values_mut() {
-                *usage *= rhs;
-            }
-            for component_reports in report.components.values_mut() {
-                for usage in component_reports.values_mut() {
-                    *usage *= rhs;
-                }
-            }
+            *report *= rhs;
         }
     }
 }
@@ -1172,14 +3072,7 @@ impl std::ops::MulAssign<f64> for ProjectUsageReport {
 impl std::ops::DivAssign<f64> for ProjectUsageReport {
     fn div_assign(&mut self, rhs: f64) {
         for report in self.reports.values_mut() {
-            for usage in report.reports.values_mut() {
-                *usage /= rhs;
-            }
-            for component_reports in report.components.values_mut() {
-                for usage in component_reports.values_mut() {
-                    *usage /= rhs;
-                }
-            }
+            *report /= rhs;
         }
     }
 }
@@ -1196,12 +3089,33 @@ impl ProjectUsageReport {
     /// Scale only the main usage totals, leaving component breakdowns unchanged.
     /// Use this when the scale factor converts credit units but components are
     /// in physical units (GPU-hours, CPU-hours etc.) that should not be scaled.
+    ///
+    /// The requeue totals are scaled with the base totals, never separately: a
+    /// caller converts to credits and then subtracts one from the other, so the
+    /// two must stay in the same units. The requeue *component* breakdowns are
+    /// left alone for the same reason the base ones are.
     pub fn scale_total(&mut self, factor: f64) {
         for report in self.reports.values_mut() {
             for usage in report.reports.values_mut() {
                 *usage *= factor;
             }
             // unattributed usage is also in the reports map under a special key
+            for usage in report.requeue_reports.values_mut() {
+                *usage *= factor;
+            }
+            for usage in report.requeue_state_usage.values_mut() {
+                *usage *= factor;
+            }
+            for reports in report.reservation_reports.values_mut() {
+                for usage in reports.values_mut() {
+                    *usage *= factor;
+                }
+            }
+            for reports in report.reservation_requeue_usage.values_mut() {
+                for usage in reports.values_mut() {
+                    *usage *= factor;
+                }
+            }
         }
     }
 
@@ -1310,11 +3224,15 @@ impl ProjectUsageReport {
     }
 
     pub fn num_jobs(&self) -> u64 {
-        self.reports.values().map(|r| r.num_jobs()).sum()
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.num_jobs())
+        })
     }
 
     pub fn total_wait_seconds(&self) -> u64 {
-        self.reports.values().map(|r| r.total_wait_seconds()).sum()
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.total_wait_seconds())
+        })
     }
 
     pub fn average_wait_seconds(&self) -> u64 {
@@ -1323,6 +3241,1157 @@ impl ProjectUsageReport {
             0 => 0,
             n => self.total_wait_seconds() / n,
         }
+    }
+
+    /// The mean number of cores a job was allocated, over every job in this
+    /// report - many small jobs against a few large ones. Computed over all
+    /// jobs, not by averaging each day's average.
+    pub fn average_cpus_per_job(&self) -> f64 {
+        match self.num_jobs() {
+            0 => 0.0,
+            n => {
+                let cpus = self.reports.values().fold(0u64, |total, report| {
+                    total.saturating_add(report.total_allocated_cpus())
+                });
+
+                cpus as f64 / n as f64
+            }
+        }
+    }
+
+    /// The mean number of GPUs a job was allocated, over every job in this
+    /// report.
+    pub fn average_gpus_per_job(&self) -> f64 {
+        match self.num_jobs() {
+            0 => 0.0,
+            n => {
+                let gpus = self.reports.values().fold(0u64, |total, report| {
+                    total.saturating_add(report.total_allocated_gpus())
+                });
+
+                gpus as f64 / n as f64
+            }
+        }
+    }
+
+    /// The mean job size for one local user - which is where an outlier shows
+    /// up, the project-wide mean having averaged them away.
+    pub fn average_cpus_per_job_for_user(&self, user: &str) -> f64 {
+        let jobs = self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.num_jobs_for_user(user))
+        });
+
+        match jobs {
+            0 => 0.0,
+            n => {
+                let cpus = self.reports.values().fold(0u64, |total, report| {
+                    total.saturating_add(report.allocated_cpus_for_user(user))
+                });
+
+                cpus as f64 / n as f64
+            }
+        }
+    }
+
+    pub fn average_gpus_per_job_for_user(&self, user: &str) -> f64 {
+        let jobs = self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.num_jobs_for_user(user))
+        });
+
+        match jobs {
+            0 => 0.0,
+            n => {
+                let gpus = self.reports.values().fold(0u64, |total, report| {
+                    total.saturating_add(report.allocated_gpus_for_user(user))
+                });
+
+                gpus as f64 / n as f64
+            }
+        }
+    }
+
+    /// The local users who ran jobs on any day in this report.
+    pub fn job_users(&self) -> Vec<String> {
+        let mut users: Vec<String> = self
+            .reports
+            .values()
+            .flat_map(|report| report.job_users())
+            .collect();
+
+        users.sort();
+        users.dedup();
+        users
+    }
+
+    pub fn num_jobs_for_user(&self, user: &str) -> u64 {
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.num_jobs_for_user(user))
+        })
+    }
+
+    pub fn wait_seconds_for_user(&self, user: &str) -> u64 {
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.wait_seconds_for_user(user))
+        })
+    }
+
+    ///
+    /// Usage attributed to one *local* user across every day in this report.
+    ///
+    /// The `usage` method above takes a `UserIdentifier` and needs a mapping to
+    /// resolve it. This one takes the local name that Slurm recorded, which is
+    /// what the per-user maps are keyed on and what the rest of the
+    /// `*_for_user` family here already accepts - a caller reading a report
+    /// straight out of a scheduler has no mapping to hand.
+    ///
+    pub fn usage_for_local_user(&self, local_user: &str) -> Usage {
+        self.reports
+            .values()
+            .map(|report| report.usage(local_user))
+            .sum()
+    }
+
+    /// The same for usage discarded by a requeue.
+    pub fn requeue_usage_for_local_user(&self, local_user: &str) -> Usage {
+        self.reports
+            .values()
+            .map(|report| report.requeue_usage(local_user))
+            .sum()
+    }
+
+    /// The mean queue wait per job for one local user, over every day.
+    pub fn average_wait_seconds_for_user(&self, user: &str) -> u64 {
+        match self.num_jobs_for_user(user) {
+            0 => 0,
+            n => self.wait_seconds_for_user(user) / n,
+        }
+    }
+
+    pub fn runtime_seconds_for_user(&self, user: &str) -> u64 {
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.runtime_seconds_for_user(user))
+        })
+    }
+
+    /// The mean runtime of a job in this report - the figure that makes a wait
+    /// mean something. See `DailyProjectUsageReport::average_runtime_seconds`.
+    pub fn average_runtime_seconds(&self) -> u64 {
+        match self.expansion_jobs() {
+            0 => 0,
+            n => self.total_runtime_seconds() / n,
+        }
+    }
+
+    pub fn average_runtime_seconds_for_user(&self, user: &str) -> u64 {
+        match self.expansion_jobs_for_user(user) {
+            0 => 0,
+            n => self.runtime_seconds_for_user(user) / n,
+        }
+    }
+
+    ///
+    /// How many jobs the runtime and expansion figures were accumulated over,
+    /// across every day in this report - the denominator for the means derived
+    /// from them, and not the same as `num_jobs`. See
+    /// `DailyProjectUsageReport::expansion_jobs`.
+    ///
+    pub fn expansion_jobs(&self) -> u64 {
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.expansion_jobs())
+        })
+    }
+
+    /// `expansion_jobs` for one local user.
+    pub fn expansion_jobs_for_user(&self, user: &str) -> u64 {
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.expansion_jobs_for_user(user))
+        })
+    }
+    ///
+    /// One user's total turnaround over their total runtime - their whole share
+    /// of the report treated as one job, on the same 1.0-is-ideal scale.
+    ///
+    /// Read beside `expansion_factor_for_user`, which is a mean of ratios. The
+    /// gap between the two is the diagnostic: a mean far above this means a
+    /// handful of the user's jobs waited a long time and then exited almost
+    /// immediately, which one figure alone cannot tell apart from a user who
+    /// simply waits.
+    ///
+    pub fn aggregate_expansion_factor_for_user(&self, user: &str) -> f64 {
+        match self.runtime_seconds_for_user(user) {
+            0 => 0.0,
+            runtime => {
+                self.wait_seconds_for_user(user).saturating_add(runtime) as f64 / runtime as f64
+            }
+        }
+    }
+
+    /// Total wall-clock runtime of every job in this report. Not usage - usage
+    /// weights each second by the fraction of a node held.
+    pub fn total_runtime_seconds(&self) -> u64 {
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.total_runtime_seconds())
+        })
+    }
+
+    ///
+    /// The mean expansion factor across every job in this report - turnaround
+    /// over runtime, `(wait + run) / run`, averaged per job. 1.0 is ideal and
+    /// 0.0 means no jobs.
+    ///
+    /// Computed from the summed thousandths and the total job count, not by
+    /// averaging each day's average: a day with four jobs would otherwise weigh
+    /// as heavily as a day with four hundred.
+    ///
+    /// See `DailyProjectUsageReport::average_expansion_factor` for what the
+    /// figure means, and for its relationship to the classical form.
+    ///
+    pub fn average_expansion_factor(&self) -> f64 {
+        let jobs = self.expansion_jobs();
+
+        match jobs {
+            0 => 0.0,
+            n => {
+                let milli = self.reports.values().fold(0u64, |total, report| {
+                    total.saturating_add(report.total_expansion_milli())
+                });
+
+                milli as f64 / (EXPANSION_SCALE as f64 * n as f64)
+            }
+        }
+    }
+
+    /// The mean expansion factor for one local user, across every day.
+    pub fn expansion_factor_for_user(&self, user: &str) -> f64 {
+        let jobs = self.expansion_jobs_for_user(user);
+
+        match jobs {
+            0 => 0.0,
+            n => {
+                let milli = self.reports.values().fold(0u64, |total, report| {
+                    total.saturating_add(report.expansion_milli_for_user(user))
+                });
+
+                milli as f64 / (EXPANSION_SCALE as f64 * n as f64)
+            }
+        }
+    }
+
+    /// Total turnaround over total runtime - the robust companion to
+    /// `average_expansion_factor`, which no single job can move much. 1.0 is
+    /// ideal, 0.0 means no jobs.
+    pub fn aggregate_expansion_factor(&self) -> f64 {
+        match self.total_runtime_seconds() {
+            0 => 0.0,
+            runtime => self.total_wait_seconds().saturating_add(runtime) as f64 / runtime as f64,
+        }
+    }
+
+    /// Usage consumed on attempts superseded by a requeue. This is the usage
+    /// that was invisible before requeue accounting: `total_usage()` counts
+    /// only each job's last attempt.
+    pub fn total_requeue_usage(&self) -> Usage {
+        self.reports.values().map(|r| r.total_requeue_usage()).sum()
+    }
+
+    /// This project's true consumption - `total_usage()` plus every superseded
+    /// attempt.
+    pub fn total_usage_including_requeues(&self) -> Usage {
+        self.total_usage() + self.total_requeue_usage()
+    }
+
+    /// The number of requeue events, not the number of jobs requeued.
+    pub fn num_requeue_events(&self) -> u64 {
+        self.reports.values().fold(0u64, |total, r| {
+            total.saturating_add(r.num_requeue_events())
+        })
+    }
+
+    pub fn requeue_wait_seconds(&self) -> u64 {
+        self.reports.values().fold(0u64, |total, r| {
+            total.saturating_add(r.requeue_wait_seconds())
+        })
+    }
+
+    /// Mean wait per requeue - not per job.
+    pub fn average_requeue_wait_seconds(&self) -> u64 {
+        match self.num_requeue_events() {
+            0 => 0,
+            n => self.requeue_wait_seconds() / n,
+        }
+    }
+
+    /// Mean total queue wait per job, counting the waits of every attempt.
+    pub fn average_wait_seconds_including_requeues(&self) -> u64 {
+        match self.num_jobs() {
+            0 => 0,
+            n => {
+                self.total_wait_seconds()
+                    .saturating_add(self.requeue_wait_seconds())
+                    / n
+            }
+        }
+    }
+
+    /// Requeue events by the terminal state of the superseded attempt, summed
+    /// over every day in this report and sorted by state.
+    pub fn requeue_states(&self) -> Vec<(String, u64)> {
+        let mut totals: HashMap<String, u64> = HashMap::new();
+
+        for report in self.reports.values() {
+            for (state, count) in report.requeue_states() {
+                accumulate(&mut totals, &state, count);
+            }
+        }
+
+        let mut states: Vec<(String, u64)> = totals.into_iter().collect();
+        states.sort();
+        states
+    }
+
+    /// Requeue usage by the terminal state of the superseded attempt.
+    pub fn requeue_usage_in_state(&self, state: &str) -> Usage {
+        self.reports
+            .values()
+            .map(|r| r.requeue_usage_in_state(state))
+            .sum()
+    }
+
+    /// True if anything about a requeue was recorded for any day, charged or
+    /// absorbed.
+    pub fn has_requeues(&self) -> bool {
+        self.reports
+            .values()
+            .any(|report| report.has_requeues() || report.has_charged_requeues())
+    }
+
+    // ---- Charged requeues ---------------------------------------------------
+
+    /// Usage from superseded attempts that this project was charged for. A
+    /// subset of `total_usage()`, never an addition to it.
+    pub fn total_charged_requeue_usage(&self) -> Usage {
+        self.reports
+            .values()
+            .map(|r| r.total_charged_requeue_usage())
+            .sum()
+    }
+
+    /// Everything requeueing cost this project, before the question of who
+    /// pays: the charged attempts plus the absorbed ones.
+    pub fn total_requeue_usage_including_charged(&self) -> Usage {
+        self.total_requeue_usage() + self.total_charged_requeue_usage()
+    }
+
+    pub fn num_charged_requeue_events(&self) -> u64 {
+        self.reports.values().fold(0u64, |total, r| {
+            total.saturating_add(r.num_charged_requeue_events())
+        })
+    }
+
+    pub fn charged_requeue_wait_seconds(&self) -> u64 {
+        self.reports.values().fold(0u64, |total, r| {
+            total.saturating_add(r.charged_requeue_wait_seconds())
+        })
+    }
+
+    pub fn has_charged_requeues(&self) -> bool {
+        self.reports
+            .values()
+            .any(|report| report.has_charged_requeues())
+    }
+
+    /// The share of this project's requeued consumption that it was charged
+    /// for, in thousandths. `None` when nothing was requeued at all.
+    pub fn charged_requeue_share_per_mille(&self) -> Option<u64> {
+        let total = self.total_requeue_usage_including_charged().seconds();
+
+        match total {
+            0 => None,
+            total => Some(
+                self.total_charged_requeue_usage()
+                    .seconds()
+                    .saturating_mul(1000)
+                    / total,
+            ),
+        }
+    }
+
+    /// Charged requeue events and usage per state, worst first - the same shape
+    /// as `requeue_state_summary`, for the half that was charged.
+    pub fn charged_requeue_state_summary(&self) -> Vec<(String, u64, Usage)> {
+        let mut events: HashMap<String, u64> = HashMap::new();
+        let mut usage: HashMap<String, Usage> = HashMap::new();
+
+        for report in self.reports.values() {
+            for state in report.charged_requeue_states() {
+                accumulate(
+                    &mut events,
+                    &state,
+                    report.charged_requeue_events_in_state(&state),
+                );
+                *usage.entry(state.clone()).or_default() +=
+                    report.charged_requeue_usage_in_state(&state);
+            }
+        }
+
+        let mut summary: Vec<(String, u64, Usage)> = events
+            .keys()
+            .chain(usage.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter()
+            .map(|state| {
+                let state_events = events.get(&state).copied().unwrap_or(0);
+                let state_usage = usage.get(&state).cloned().unwrap_or_default();
+                (state, state_events, state_usage)
+            })
+            .collect();
+
+        summary.sort_by(|a, b| b.2.seconds().cmp(&a.2.seconds()).then(a.0.cmp(&b.0)));
+        summary
+    }
+
+    // ---- Reservations ------------------------------------------------------
+
+    /// True if any of this project's jobs ran inside a reservation.
+    pub fn has_reservations(&self) -> bool {
+        self.reports
+            .values()
+            .any(|report| report.has_reservations())
+    }
+
+    /// The reservations this project's jobs ran under, sorted by name.
+    pub fn reservations(&self) -> Vec<String> {
+        let mut reservations: Vec<String> = self
+            .reports
+            .values()
+            .flat_map(|report| report.reservations())
+            .collect();
+
+        reservations.sort();
+        reservations.dedup();
+        reservations
+    }
+
+    /// Usage this project consumed inside `reservation`, counting every attempt.
+    pub fn reservation_usage(&self, reservation: &str) -> Usage {
+        self.reports
+            .values()
+            .map(|report| report.reservation_usage(reservation))
+            .sum()
+    }
+
+    /// The part of `reservation_usage` that was discarded by a requeue.
+    pub fn reservation_requeue_usage(&self, reservation: &str) -> Usage {
+        self.reports
+            .values()
+            .map(|report| report.reservation_requeue_usage(reservation))
+            .sum()
+    }
+
+    pub fn reservation_jobs(&self, reservation: &str) -> u64 {
+        self.reports.values().fold(0u64, |total, report| {
+            total.saturating_add(report.reservation_jobs(reservation))
+        })
+    }
+
+    /// Usage consumed inside any reservation, counting every attempt.
+    pub fn total_reservation_usage(&self) -> Usage {
+        self.reports
+            .values()
+            .map(|report| report.total_reservation_usage())
+            .sum()
+    }
+
+    /// Usage consumed outside any reservation.
+    pub fn usage_outside_reservations(&self) -> Usage {
+        self.total_usage_including_requeues() - self.total_reservation_usage()
+    }
+
+    /// Jobs, usage and discarded share per reservation, busiest first.
+    pub fn reservation_summary(&self) -> Vec<(String, u64, Usage, Usage)> {
+        let mut summary: Vec<(String, u64, Usage, Usage)> = self
+            .reservations()
+            .into_iter()
+            .map(|reservation| {
+                let jobs = self.reservation_jobs(&reservation);
+                let usage = self.reservation_usage(&reservation);
+                let requeued = self.reservation_requeue_usage(&reservation);
+                (reservation, jobs, usage, requeued)
+            })
+            .collect();
+
+        summary.sort_by(|a, b| b.2.seconds().cmp(&a.2.seconds()).then(a.0.cmp(&b.0)));
+        summary
+    }
+
+    ///
+    /// A readable summary of how well this project's jobs were served, and what
+    /// shape they were.
+    ///
+    /// Both of these are distribution questions being asked of a single number,
+    /// so the per-user table is the point of the report rather than a refinement
+    /// of it: a project-wide mean job size of twenty cores can be four
+    /// 512-core jobs beside a hundred 2-core ones, describing neither.
+    ///
+    pub fn expansion_factor_report(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        let rule = "=".repeat(83);
+
+        // `write!` to a String cannot fail, so the results are deliberately
+        // discarded rather than unwrapped - `unwrap` is denied in this crate.
+        let _ = writeln!(out, "Expansion factor and job size for {}", self.project());
+        let _ = writeln!(out, "{}", rule);
+
+        if self.num_jobs() == 0 {
+            let _ = writeln!(out, "No jobs recorded.");
+            let _ = writeln!(out, "{}", rule);
+            return out;
+        }
+
+        // A report that predates these statistics has jobs but no runtime, so
+        // every figure below would come out as 0.00 - which on this scale reads
+        // as "turned around instantly", the opposite of the truth. Say what is
+        // actually the case instead.
+        if self.total_runtime_seconds() == 0 {
+            let _ = writeln!(
+                out,
+                "{} jobs | mean wait {}",
+                self.num_jobs(),
+                Usage::new(self.average_wait_seconds()).in_hours()
+            );
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "No expansion factor or job size recorded - this report was produced before"
+            );
+            let _ = writeln!(out, "those statistics were collected.");
+            let _ = writeln!(out, "{}", rule);
+            return out;
+        }
+
+        let mean = self.average_expansion_factor();
+        let aggregate = self.aggregate_expansion_factor();
+
+        let _ = writeln!(
+            out,
+            "{} jobs | mean expansion factor {:.2} | overall {:.2}",
+            self.num_jobs(),
+            mean,
+            aggregate
+        );
+        let _ = writeln!(
+            out,
+            "Mean wait {} | mean runtime {}",
+            Usage::new(self.average_wait_seconds()).in_hours(),
+            Usage::new(self.average_runtime_seconds()).in_hours()
+        );
+        let _ = writeln!(
+            out,
+            "Mean job size {:.1} cores, {:.1} gpus",
+            self.average_cpus_per_job(),
+            self.average_gpus_per_job()
+        );
+        // The mean is the sum of per-job ratios over the job count, so it is
+        // exactly "how many times its own runtime the average job took to turn
+        // around" - worth spelling out, because a bare ratio invites being read
+        // as a percentage.
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "The average job took {:.2} times its own runtime to turn around; 1.00 would",
+            mean
+        );
+        let _ = writeln!(out, "mean it ran the moment it became eligible.");
+
+        // The gap between the two forms is the most useful thing in the report:
+        // they are moved by opposite ends of the job-size distribution.
+        //
+        // Compared as excesses over 1.0, not as raw values. On this scale 1.0 is
+        // "waited not at all", so all the signal is in the part above it -
+        // comparing 1.02 against 1.97 as a ratio says they are similar when one
+        // project waited fifty times as much as the other. Nothing is said at
+        // all when both excesses are small, because then there is nothing to
+        // explain.
+        let mean_excess = (mean - 1.0).max(0.0);
+        let aggregate_excess = (aggregate - 1.0).max(0.0);
+        let worth_explaining = mean_excess.max(aggregate_excess) > 0.25;
+
+        if worth_explaining && mean_excess > aggregate_excess * 2.0 {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "The mean is well above the overall figure, so some *short* jobs waited a"
+            );
+            let _ = writeln!(
+                out,
+                "long time - a pattern worth chasing, and often a user fighting a job that"
+            );
+            let _ = writeln!(out, "will not run. The per-user table below says who.");
+        } else if worth_explaining && aggregate_excess > mean_excess * 2.0 {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "The overall figure is well above the mean, so the waiting fell on the"
+            );
+            let _ = writeln!(
+                out,
+                "*long* jobs - which is usually queue contention rather than anything wrong."
+            );
+        }
+
+        // ---- per user, worst-served first
+        let mut local_to_portal = HashMap::new();
+
+        for (user, local_user) in &self.users {
+            local_to_portal.insert(local_user.clone(), user.clone());
+        }
+
+        #[allow(clippy::type_complexity)]
+        let mut users: Vec<(String, u64, f64, f64, f64, u64, u64, f64)> = self
+            .job_users()
+            .into_iter()
+            .map(|user| {
+                let jobs = self.num_jobs_for_user(&user);
+                let expansion = self.expansion_factor_for_user(&user);
+                let cpus = self.average_cpus_per_job_for_user(&user);
+                let gpus = self.average_gpus_per_job_for_user(&user);
+                let wait = self.average_wait_seconds_for_user(&user);
+                let runtime = self.average_runtime_seconds_for_user(&user);
+                let aggregate = self.aggregate_expansion_factor_for_user(&user);
+                (user, jobs, expansion, cpus, gpus, wait, runtime, aggregate)
+            })
+            .collect();
+
+        // Sorted on the *overall* figure, not the mean. The mean is the outlier
+        // detector - one freak job moves it a long way - so ranking on it puts
+        // whoever had the single strangest job at the top, which is not the same
+        // question as who was worst served. The mean breaks ties, and the name
+        // after that, so the order is stable.
+        users.sort_by(|a, b| {
+            b.7.partial_cmp(&a.7)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then(a.0.cmp(&b.0))
+        });
+
+        // Merging a legacy day with a recent one can leave a row with no
+        // expansion or size data. Zero is this scale's "not recorded" sentinel,
+        // so show it as one rather than as a score of nought. A GPU count of
+        // zero is a real answer and is printed as it is.
+        let or_dash = |value: f64, places: usize| match value > 0.0 {
+            true => format!("{:.*}", places, value),
+            false => "-".to_string(),
+        };
+
+        // The wait and runtime columns are hours, said once in the header rather
+        // than on every row: a column of "11.608 hours" is two thirds
+        // punctuation and pushes the table past any sensible width, and these
+        // two are read against each other rather than in isolation.
+        let hours = |seconds: u64| match seconds > 0 {
+            true => format!("{:.3}", Usage::new(seconds).hours()),
+            false => "-".to_string(),
+        };
+
+        // The two expansion columns sit together because it is the gap between
+        // them that an operator is looking for. `overall` is the whole user
+        // treated as one job - how badly they were served, all told - and `mean`
+        // is the mean of the per-job ratios, which one freak job can dominate.
+        // A mean far above the overall figure means a few of their jobs queued a
+        // long time and then exited almost at once; the two agreeing means the
+        // user simply waits. Neither says that on its own.
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  {:<24} {:>5} {:>8} {:>9} {:>8} {:>8} {:>7} {:>5}",
+            "user", "jobs", "overall", "mean", "run (h)", "wait (h)", "cores", "gpus"
+        );
+
+        for (user, jobs, expansion, cpus, gpus, wait, runtime, aggregate) in users {
+            let label = match local_to_portal.get(&user) {
+                Some(portal_user) => portal_user.to_string(),
+                None => format!("{} - unknown", user),
+            };
+
+            let _ = writeln!(
+                out,
+                "  {:<24} {:>5} {:>8} {:>9} {:>8} {:>8} {:>7} {:>5}",
+                label,
+                jobs,
+                or_dash(aggregate, 2),
+                or_dash(expansion, 2),
+                hours(runtime),
+                hours(wait),
+                or_dash(cpus, 1),
+                format!("{:.1}", gpus)
+            );
+        }
+
+        // ---- per day, so a change over time is visible
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  {:<24} {:>5} {:>8} {:>9} {:>8} {:>8} {:>7} {:>5}",
+            "day", "jobs", "overall", "mean", "run (h)", "wait (h)", "cores", "gpus"
+        );
+
+        for date in self.dates() {
+            let Some(report) = self.reports.get(&date) else {
+                continue;
+            };
+
+            if report.num_jobs() == 0 {
+                continue;
+            }
+
+            let _ = writeln!(
+                out,
+                "  {:<24} {:>5} {:>8} {:>9} {:>8} {:>8} {:>7} {:>5}",
+                date.to_string(),
+                report.num_jobs(),
+                or_dash(report.aggregate_expansion_factor(), 2),
+                or_dash(report.average_expansion_factor(), 2),
+                hours(report.average_runtime_seconds()),
+                hours(report.average_wait_seconds()),
+                or_dash(report.average_cpus_per_job(), 1),
+                format!("{:.1}", report.average_gpus_per_job())
+            );
+        }
+
+        let _ = writeln!(out, "{}", rule);
+        let _ = writeln!(
+            out,
+            "Expansion factor is turnaround over runtime, so 1.00 is ideal and higher is"
+        );
+        let _ = writeln!(
+            out,
+            "worse. Rows are ordered by `overall`, which treats the whole row as one job"
+        );
+        let _ = writeln!(
+            out,
+            "and is the better measure of how badly someone was served. `mean` averages"
+        );
+        let _ = writeln!(
+            out,
+            "the per-job ratios, so a mean far above the overall figure means a few jobs"
+        );
+        let _ = writeln!(
+            out,
+            "queued a long time and then exited almost at once - the runtime column is"
+        );
+        let _ = writeln!(
+            out,
+            "where that shows. The two agreeing means the waiting was spread across the"
+        );
+        let _ = writeln!(
+            out,
+            "work. Job sizes count each job once however long it ran, so they describe"
+        );
+        let _ = writeln!(
+            out,
+            "the shape of the jobs rather than what the machine was busy with."
+        );
+
+        out
+    }
+
+    ///
+    /// A readable summary of what this project ran inside reservations.
+    ///
+    /// This answers "what did this project put into each reservation", which is
+    /// the half of reservation utilisation a usage report can answer. The other
+    /// half - what the reservation *held* - is a property of the reservation
+    /// rather than of any project, and no per-project report can supply it: a
+    /// reservation may be shared by several projects, and its capacity comes
+    /// from its node count and duration, which the job records do not carry. So
+    /// the shares below are shares of this project's own consumption, and are
+    /// deliberately not called utilisation.
+    ///
+    pub fn reservation_report(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        let rule = "=".repeat(64);
+
+        // `write!` to a String cannot fail, so the results are deliberately
+        // discarded rather than unwrapped - `unwrap` is denied in this crate.
+        let _ = writeln!(out, "Reservation summary for {}", self.project());
+        let _ = writeln!(out, "{}", rule);
+
+        if !self.has_reservations() {
+            let _ = writeln!(out, "No jobs ran inside a reservation.");
+            let _ = writeln!(out, "{}", rule);
+            return out;
+        }
+
+        let truth = self.total_usage_including_requeues();
+        let reserved = self.total_reservation_usage();
+
+        let percent = |part: &Usage| match truth.seconds() {
+            0 => 0.0,
+            total => 100.0 * part.seconds() as f64 / total as f64,
+        };
+
+        let _ = writeln!(
+            out,
+            "Consumed inside reservations  : {:>14}  ({:.1}% of this project)",
+            reserved.in_hours().to_string(),
+            percent(&reserved)
+        );
+        let _ = writeln!(
+            out,
+            "Consumed outside reservations : {:>14}",
+            self.usage_outside_reservations().in_hours().to_string()
+        );
+        let _ = writeln!(
+            out,
+            "True consumption              : {:>14}",
+            truth.in_hours().to_string()
+        );
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "By reservation:");
+
+        for (reservation, jobs, usage, requeued) in self.reservation_summary() {
+            let _ = writeln!(
+                out,
+                "  {:<24} {:>5} {:<5} {:>14}  ({:.1}%)",
+                reservation,
+                jobs,
+                if jobs == 1 { "job" } else { "jobs" },
+                usage.in_hours().to_string(),
+                percent(&usage)
+            );
+
+            if !requeued.is_zero() {
+                let _ = writeln!(
+                    out,
+                    "  {:<24} {:>5} {:<5} {:>14}   of which discarded by requeues",
+                    "",
+                    "",
+                    "",
+                    requeued.in_hours().to_string()
+                );
+            }
+        }
+
+        // ---- per day, then per user within each reservation
+        let _ = writeln!(out);
+        let _ = writeln!(out, "By day:");
+
+        for date in self.dates() {
+            let Some(report) = self.reports.get(&date) else {
+                continue;
+            };
+
+            if !report.has_reservations() {
+                continue;
+            }
+
+            for (reservation, jobs, usage, _) in report.reservation_summary() {
+                let _ = writeln!(
+                    out,
+                    "  {:<12} {:<24} {:>5} {:<5} {:>14}",
+                    date.to_string(),
+                    reservation,
+                    jobs,
+                    if jobs == 1 { "job" } else { "jobs" },
+                    usage.in_hours().to_string()
+                );
+            }
+        }
+
+        let mut local_to_portal = HashMap::new();
+
+        for (user, local_user) in &self.users {
+            local_to_portal.insert(local_user.clone(), user.clone());
+        }
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "By user:");
+
+        for reservation in self.reservations() {
+            let mut users: Vec<String> = self
+                .reports
+                .values()
+                .flat_map(|report| report.reservation_users(&reservation))
+                .collect();
+
+            users.sort();
+            users.dedup();
+
+            for user in users {
+                let usage: Usage = self
+                    .reports
+                    .values()
+                    .map(|report| report.reservation_usage_for_user(&reservation, &user))
+                    .sum();
+
+                let label = match local_to_portal.get(&user) {
+                    Some(portal_user) => portal_user.to_string(),
+                    None => format!("{} - unknown", user),
+                };
+
+                let _ = writeln!(
+                    out,
+                    "  {:<24} {:<24} {:>14}",
+                    reservation,
+                    label,
+                    usage.in_hours().to_string()
+                );
+            }
+        }
+
+        let _ = writeln!(out, "{}", rule);
+        let _ = writeln!(
+            out,
+            "Shares are of this project's own consumption. What each reservation held -"
+        );
+        let _ = writeln!(
+            out,
+            "and so how fully it was used - is a property of the reservation, not of any"
+        );
+        let _ = writeln!(out, "one project, and is not available from these records.");
+
+        out
+    }
+
+    /// Requeue events and usage per interrupting state, worst first - see
+    /// `DailyProjectUsageReport::requeue_state_summary`.
+    pub fn requeue_state_summary(&self) -> Vec<(String, u64, Usage)> {
+        let mut events: HashMap<String, u64> = HashMap::new();
+        let mut usage: HashMap<String, Usage> = HashMap::new();
+
+        for report in self.reports.values() {
+            for (state, state_events, state_usage) in report.requeue_state_summary() {
+                accumulate(&mut events, &state, state_events);
+                *usage.entry(state).or_default() += state_usage;
+            }
+        }
+
+        let mut summary: Vec<(String, u64, Usage)> = events
+            .keys()
+            .chain(usage.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter()
+            .map(|state| {
+                let state_events = events.get(&state).copied().unwrap_or(0);
+                let state_usage = usage.get(&state).cloned().unwrap_or_default();
+                (state, state_events, state_usage)
+            })
+            .collect();
+
+        summary.sort_by(|a, b| b.2.seconds().cmp(&a.2.seconds()).then(a.0.cmp(&b.0)));
+        summary
+    }
+
+    ///
+    /// A readable summary of everything this report knows about requeues.
+    ///
+    /// The figures a charging decision needs, in one place: what was reported,
+    /// what was discarded, what Slurm thinks the true total is, and - because
+    /// this is usually the question that matters - which states did the
+    /// interrupting, since work lost to a node failure is the site's doing and
+    /// work lost to preemption is the site's policy.
+    ///
+    /// Everything is in hours, so the columns are comparable at a glance.
+    /// `Usage`'s own formatting rescales itself per value, which is right for a
+    /// single figure and unreadable in a table.
+    ///
+    pub fn requeue_report(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        let rule = "=".repeat(64);
+
+        // `write!` to a String cannot fail, so the results are deliberately
+        // discarded rather than unwrapped - `unwrap` is denied in this crate.
+        let _ = writeln!(out, "Requeue summary for {}", self.project());
+        let _ = writeln!(out, "{}", rule);
+
+        if !self.has_requeues() {
+            let _ = writeln!(out, "No requeued jobs recorded.");
+            let _ = writeln!(out, "{}", rule);
+            return out;
+        }
+
+        let reported = self.total_usage();
+        let discarded = self.total_requeue_usage();
+        let truth = self.total_usage_including_requeues();
+        let charged = self.total_charged_requeue_usage();
+
+        let percent = |part: &Usage| match truth.seconds() {
+            0 => 0.0,
+            total => 100.0 * part.seconds() as f64 / total as f64,
+        };
+
+        let _ = writeln!(
+            out,
+            "Reported usage (charged to the project)    : {:>14}",
+            reported.in_hours().to_string()
+        );
+        let _ = writeln!(
+            out,
+            "Discarded by requeues (not charged)        : {:>14}  ({:.1}%)",
+            discarded.in_hours().to_string(),
+            percent(&discarded)
+        );
+        let _ = writeln!(
+            out,
+            "True consumption (Slurm's view)            : {:>14}",
+            truth.in_hours().to_string()
+        );
+
+        // The charged share is a slice of the line above it rather than a line
+        // of its own in the same column of arithmetic, so it is set apart: it
+        // must never be read as a fourth figure to be added to the other three.
+        if self.has_charged_requeues() {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "Of the usage charged, {} came from requeued attempts the project asked",
+                charged.in_hours()
+            );
+
+            match self.charged_requeue_share_per_mille() {
+                Some(share) => {
+                    let _ = writeln!(
+                        out,
+                        "for - {:.1}% of everything requeueing cost it; the site absorbed the rest.",
+                        share as f64 / 10.0
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "for.");
+                }
+            }
+        }
+
+        let _ = writeln!(out);
+
+        let events = self.num_requeue_events();
+        let charged_events = self.num_charged_requeue_events();
+        let _ = writeln!(
+            out,
+            "{} absorbed requeue {}, {} charged",
+            events,
+            if events == 1 { "event" } else { "events" },
+            charged_events
+        );
+        let _ = writeln!(
+            out,
+            "Queue wait discarded: {} in total, {} per absorbed requeue",
+            Usage::new(self.requeue_wait_seconds()).in_hours(),
+            Usage::new(self.average_requeue_wait_seconds()).in_hours()
+        );
+
+        // ---- by interrupting state
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Work was interrupted by, and absorbed by the site:");
+
+        for (state, state_events, state_usage) in self.requeue_state_summary() {
+            let _ = writeln!(
+                out,
+                "  {:<16} {:>4} {:<7} {:>14}  ({:.1}%)",
+                state,
+                state_events,
+                if state_events == 1 { "event" } else { "events" },
+                state_usage.in_hours().to_string(),
+                percent(&state_usage)
+            );
+        }
+
+        if self.has_charged_requeues() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Interrupted and charged to the project:");
+
+            for (state, state_events, state_usage) in self.charged_requeue_state_summary() {
+                let _ = writeln!(
+                    out,
+                    "  {:<16} {:>4} {:<7} {:>14}  ({:.1}%)",
+                    state,
+                    state_events,
+                    if state_events == 1 { "event" } else { "events" },
+                    state_usage.in_hours().to_string(),
+                    percent(&state_usage)
+                );
+            }
+        }
+
+        // ---- by day
+        let _ = writeln!(out);
+        let _ = writeln!(out, "By day:");
+
+        for date in self.dates() {
+            let Some(report) = self.reports.get(&date) else {
+                continue;
+            };
+
+            if !report.has_requeues() {
+                continue;
+            }
+
+            let day_events = report.num_requeue_events();
+            let _ = writeln!(
+                out,
+                "  {:<16} {:>4} {:<7} {:>14}  (reported {})",
+                date.to_string(),
+                day_events,
+                if day_events == 1 { "event" } else { "events" },
+                report.total_requeue_usage().in_hours().to_string(),
+                report.total_usage().in_hours()
+            );
+        }
+
+        // ---- by user, labelled with the portal identifier where we have one
+        let mut local_to_portal = HashMap::new();
+
+        for (user, local_user) in &self.users {
+            local_to_portal.insert(local_user.clone(), user.clone());
+        }
+
+        let mut users: Vec<String> = Vec::new();
+
+        for report in self.reports.values() {
+            users.extend(report.requeue_users());
+        }
+
+        users.sort();
+        users.dedup();
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "By user:");
+
+        for user in users {
+            let mut user_events = 0u64;
+            let mut user_usage = Usage::default();
+
+            for report in self.reports.values() {
+                user_events = user_events.saturating_add(report.requeue_events_for_user(&user));
+                user_usage += report.requeue_usage(&user);
+            }
+
+            let label = match local_to_portal.get(&user) {
+                Some(portal_user) => portal_user.to_string(),
+                None => format!("{} - unknown", user),
+            };
+
+            let _ = writeln!(
+                out,
+                "  {:<24} {:>4} {:<7} {:>14}",
+                label,
+                user_events,
+                if user_events == 1 { "event" } else { "events" },
+                user_usage.in_hours().to_string()
+            );
+        }
+
+        let _ = writeln!(out, "{}", rule);
+
+        out
     }
 
     /// Returns a display adapter that formats all usage values in hours only.
@@ -1338,7 +4407,10 @@ impl ProjectUsageReport {
             .into_iter()
             .filter_map(|date| {
                 let report = self.reports.get(date)?;
-                if with_usage_only && report.total_usage() == Usage::default() {
+                if with_usage_only
+                    && report.total_usage() == Usage::default()
+                    && !report.has_requeues()
+                {
                     return None;
                 }
                 Some(report.clone())
@@ -1876,6 +4948,144 @@ impl UsageReport {
         self.reports.values().map(|r| r.total_usage()).sum()
     }
 
+    /// Usage consumed on attempts superseded by a requeue - see
+    /// `ProjectUsageReport::total_requeue_usage`.
+    pub fn total_requeue_usage(&self) -> Usage {
+        self.reports.values().map(|r| r.total_requeue_usage()).sum()
+    }
+
+    /// True consumption across every project in this report.
+    pub fn total_usage_including_requeues(&self) -> Usage {
+        self.total_usage() + self.total_requeue_usage()
+    }
+
+    /// The number of requeue events, not the number of jobs requeued.
+    pub fn num_requeue_events(&self) -> u64 {
+        self.reports.values().fold(0u64, |total, r| {
+            total.saturating_add(r.num_requeue_events())
+        })
+    }
+
+    /// True if anything about a requeue was recorded for any project.
+    pub fn has_requeues(&self) -> bool {
+        self.reports.values().any(|report| report.has_requeues())
+    }
+
+    /// True if any project's jobs ran inside a reservation.
+    pub fn has_reservations(&self) -> bool {
+        self.reports
+            .values()
+            .any(|report| report.has_reservations())
+    }
+
+    /// Usage consumed inside any reservation, across every project.
+    pub fn total_reservation_usage(&self) -> Usage {
+        self.reports
+            .values()
+            .map(|report| report.total_reservation_usage())
+            .sum()
+    }
+
+    ///
+    ///
+    /// A readable expansion-factor and job-size summary for every project that
+    /// ran any jobs - see `ProjectUsageReport::expansion_factor_report`.
+    ///
+    pub fn expansion_factor_report(&self) -> String {
+        use std::fmt::Write;
+
+        let mut projects: Vec<&ProjectIdentifier> = self.reports.keys().collect();
+        projects.sort_by_cached_key(|project| project.to_string());
+
+        let mut out = String::new();
+
+        for project in projects {
+            let Some(report) = self.reports.get(project) else {
+                continue;
+            };
+
+            if report.num_jobs() == 0 {
+                continue;
+            }
+
+            // `write!` to a String cannot fail
+            let _ = write!(out, "{}", report.expansion_factor_report());
+        }
+
+        if out.is_empty() {
+            let _ = writeln!(out, "No jobs recorded for any project.");
+        }
+
+        out
+    }
+
+    /// A readable reservation summary for every project that ran inside one.
+    ///
+    /// Note what this is not: a reservation's own utilisation. A reservation is
+    /// usually shared between projects, so even summed over a portal these are
+    /// the shares each project contributed, not how full the reservation was -
+    /// see `ProjectUsageReport::reservation_report`.
+    ///
+    pub fn reservation_report(&self) -> String {
+        use std::fmt::Write;
+
+        let mut projects: Vec<&ProjectIdentifier> = self.reports.keys().collect();
+        projects.sort_by_cached_key(|project| project.to_string());
+
+        let mut out = String::new();
+
+        for project in projects {
+            let Some(report) = self.reports.get(project) else {
+                continue;
+            };
+
+            if !report.has_reservations() {
+                continue;
+            }
+
+            // `write!` to a String cannot fail
+            let _ = write!(out, "{}", report.reservation_report());
+        }
+
+        if out.is_empty() {
+            let _ = writeln!(out, "No jobs ran inside a reservation for any project.");
+        }
+
+        out
+    }
+
+    /// A readable requeue summary for every project that has one - see
+    /// `ProjectUsageReport::requeue_report`. Projects with no requeues are left
+    /// out rather than listed as empty, since on a real portal they are the
+    /// overwhelming majority.
+    pub fn requeue_report(&self) -> String {
+        use std::fmt::Write;
+
+        let mut projects: Vec<&ProjectIdentifier> = self.reports.keys().collect();
+        projects.sort_by_cached_key(|project| project.to_string());
+
+        let mut out = String::new();
+
+        for project in projects {
+            let Some(report) = self.reports.get(project) else {
+                continue;
+            };
+
+            if !report.has_requeues() {
+                continue;
+            }
+
+            // `write!` to a String cannot fail
+            let _ = write!(out, "{}", report.requeue_report());
+        }
+
+        if out.is_empty() {
+            let _ = writeln!(out, "No requeued jobs recorded for any project.");
+        }
+
+        out
+    }
+
     /// Remap all projects in this report to a new portal.
     ///
     /// Updates `self.portal` and remaps every contained `ProjectUsageReport`
@@ -2069,6 +5279,2213 @@ impl Allocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daily report with both a base and a requeue figure, as `op-slurm`
+    /// builds one: two jobs' worth of base usage and three superseded attempts.
+    fn report_with_requeues() -> DailyProjectUsageReport {
+        let mut report = DailyProjectUsageReport::default();
+
+        report.add_usage("alice", Usage::new(1800));
+        report.add_component_usage("cpu", "alice", Usage::new(3600));
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 60);
+
+        report.add_usage("bob", Usage::new(600));
+        report.add_jobs("bob", 1);
+        report.add_wait_seconds("bob", 30);
+
+        report.add_requeue_usage("alice", Usage::new(7200));
+        report.add_requeue_state_usage("NODE_FAIL", Usage::new(7200));
+        report.add_requeue_component_usage("cpu", "alice", Usage::new(14400));
+        report.add_requeue_events("alice", "NODE_FAIL", 2);
+        report.add_requeue_wait_seconds("alice", 300);
+
+        report.add_requeue_usage("bob", Usage::new(900));
+        report.add_requeue_state_usage("PREEMPTED", Usage::new(900));
+        report.add_requeue_events("bob", "PREEMPTED", 1);
+        report.add_requeue_wait_seconds("bob", 120);
+
+        report
+    }
+
+    ///
+    /// A real month of one project's usage, as `op-slurm` produced it, with the
+    /// project and usernames anonymised and nothing else touched.
+    ///
+    /// Synthetic reports can only check that the arithmetic agrees with itself.
+    /// This one checks it against numbers a cluster actually generated - 24
+    /// days, 357 jobs, eight users of very different habits, requeues in both
+    /// states, an `interactive` reservation appearing on some days and not
+    /// others, and one day whose reports are still incomplete.
+    ///
+    fn real_month() -> ProjectUsageReport {
+        ProjectUsageReport::from_json(include_str!("../tests/data/project-usage-report.json"))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_a_real_month_of_data_is_internally_consistent() {
+        let report = real_month();
+
+        assert_eq!(report.dates().len(), 24);
+
+        // every day's per-user maps sum to its own scalars, its per-state maps
+        // account for every requeue event and second, and no reservation claims
+        // more than the day consumed
+        for date in report.dates() {
+            let daily = report.get_report(&date);
+            assert!(
+                daily.daily_reports(false).iter().all(|d| d.is_consistent()),
+                "inconsistent report for {}",
+                date
+            );
+        }
+
+        // and the month's totals are what the days add up to
+        assert_eq!(report.total_usage(), Usage::new(13_390_528));
+        assert_eq!(report.total_requeue_usage(), Usage::new(5_547_234));
+        assert_eq!(
+            report.total_usage_including_requeues(),
+            Usage::new(13_390_528 + 5_547_234)
+        );
+        assert_eq!(report.num_jobs(), 357);
+        assert_eq!(report.total_wait_seconds(), 5_287_100);
+        assert_eq!(report.num_requeue_events(), 12);
+        assert_eq!(report.requeue_wait_seconds(), 932_011);
+        assert_eq!(report.total_runtime_seconds(), 2_066_571);
+        assert_eq!(report.total_reservation_usage(), Usage::new(254_220));
+        assert_eq!(report.reservation_jobs("interactive"), 82);
+
+        // requeues in both states, worst first
+        assert_eq!(
+            report.requeue_state_summary(),
+            vec![
+                ("REQUEUED".to_string(), 9, Usage::new(4_366_354)),
+                ("NODE_FAIL".to_string(), 3, Usage::new(1_180_880)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_splitting_a_month_into_days_and_recombining_gives_the_same_totals() {
+        // Every figure in a report has to be additive over days, or a monthly
+        // report and the same month summed from its days would disagree - and
+        // `op-slurm` builds a month exactly by summing days.
+        let report = real_month();
+
+        let mut recombined = DailyProjectUsageReport::default();
+
+        for date in report.dates() {
+            let daily = report.get_report(&date);
+            for day in daily.daily_reports(false) {
+                recombined += day;
+            }
+        }
+
+        assert_eq!(recombined.total_usage(), report.total_usage());
+        assert_eq!(
+            recombined.total_requeue_usage(),
+            report.total_requeue_usage()
+        );
+        assert_eq!(recombined.num_jobs(), report.num_jobs());
+        assert_eq!(recombined.total_wait_seconds(), report.total_wait_seconds());
+        assert_eq!(recombined.num_requeue_events(), report.num_requeue_events());
+        assert_eq!(
+            recombined.requeue_wait_seconds(),
+            report.requeue_wait_seconds()
+        );
+        assert_eq!(
+            recombined.total_runtime_seconds(),
+            report.total_runtime_seconds()
+        );
+        assert_eq!(
+            recombined.total_reservation_usage(),
+            report.total_reservation_usage()
+        );
+        assert_eq!(recombined.reservation_jobs("interactive"), 82);
+        assert_eq!(
+            recombined.requeue_state_summary(),
+            report.requeue_state_summary()
+        );
+
+        // the component breakdowns too
+        for component in ["cpu", "gpu", "memory", "billing"] {
+            assert_eq!(
+                recombined.total_requeue_component_usage(component),
+                report.get_component(component).total_requeue_usage(),
+                "component {} disagrees",
+                component
+            );
+        }
+
+        // and the recombined day is still internally consistent
+        assert!(recombined.is_consistent());
+    }
+
+    #[test]
+    fn test_the_derived_ratios_survive_recombination() {
+        // The ratios are the part that could plausibly not survive, since each
+        // is a quotient of two sums - so they have to be computed from the sums
+        // rather than from other ratios.
+        let report = real_month();
+
+        let mut recombined = DailyProjectUsageReport::default();
+        for date in report.dates() {
+            for day in report.get_report(&date).daily_reports(false) {
+                recombined += day;
+            }
+        }
+
+        assert_eq!(
+            recombined.average_expansion_factor(),
+            report.average_expansion_factor()
+        );
+        assert_eq!(
+            recombined.aggregate_expansion_factor(),
+            report.aggregate_expansion_factor()
+        );
+        assert_eq!(
+            recombined.average_cpus_per_job(),
+            report.average_cpus_per_job()
+        );
+        assert_eq!(
+            recombined.average_gpus_per_job(),
+            report.average_gpus_per_job()
+        );
+        assert_eq!(
+            recombined.average_requeue_wait_seconds(),
+            report.average_requeue_wait_seconds()
+        );
+
+        // the real figures, for the record: jobs on this cluster waited a great
+        // deal longer than they ran
+        assert!((report.average_expansion_factor() - 2_150.719_031).abs() < 1e-5);
+        assert!((report.aggregate_expansion_factor() - 3.558_393).abs() < 1e-5);
+        assert!((report.average_cpus_per_job() - 1_062.655_462).abs() < 1e-5);
+
+        // and per user, which is where the answer actually is
+        assert!((report.expansion_factor_for_user("user1.project") - 7_290.137).abs() < 0.01);
+        assert!((report.expansion_factor_for_user("user8.project") - 1.002).abs() < 0.01);
+        assert_eq!(report.num_jobs_for_user("user2.project"), 214);
+    }
+
+    #[test]
+    fn test_a_project_mean_is_not_the_mean_of_daily_means() {
+        // Real data proving why the project figure is computed over every job
+        // rather than by averaging each day's average: on this month the two
+        // differ by more than two hundred.
+        let report = real_month();
+
+        let daily_means: Vec<f64> = report
+            .dates()
+            .iter()
+            .flat_map(|date| report.get_report(date).daily_reports(false))
+            .filter(|day| day.num_jobs() > 0)
+            .map(|day| day.average_expansion_factor())
+            .collect();
+
+        let mean_of_means = daily_means.iter().sum::<f64>() / daily_means.len() as f64;
+
+        assert!((mean_of_means - 1_945.591_234).abs() < 1e-5);
+        assert!(
+            (report.average_expansion_factor() - mean_of_means).abs() > 200.0,
+            "the two must differ, or the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn test_filtering_a_month_into_halves_partitions_every_total() {
+        // The same additivity from the other direction - a date range carved out
+        // of a report and its complement have to add back up to it.
+        let report = real_month();
+
+        let first = report.filter(&DateRange::parse("2026-08-01:2026-08-12").unwrap());
+        let second = report.filter(&DateRange::parse("2026-08-13:2026-08-24").unwrap());
+
+        assert_eq!(first.dates().len(), 12);
+        assert_eq!(second.dates().len(), 12);
+
+        assert_eq!(
+            first.total_usage() + second.total_usage(),
+            report.total_usage()
+        );
+        assert_eq!(
+            first.total_requeue_usage() + second.total_requeue_usage(),
+            report.total_requeue_usage()
+        );
+        assert_eq!(first.num_jobs() + second.num_jobs(), report.num_jobs());
+        assert_eq!(
+            first.num_requeue_events() + second.num_requeue_events(),
+            report.num_requeue_events()
+        );
+        assert_eq!(
+            first.total_runtime_seconds() + second.total_runtime_seconds(),
+            report.total_runtime_seconds()
+        );
+        assert_eq!(
+            first.total_reservation_usage() + second.total_reservation_usage(),
+            report.total_reservation_usage()
+        );
+
+        // every requeue in this month happened in the first half, and every
+        // reservation figure is split across both - so neither half is trivial
+        assert_eq!(first.num_requeue_events(), 12);
+        assert!(first.has_reservations() && second.has_reservations());
+    }
+
+    #[test]
+    fn test_the_real_month_round_trips_through_the_minimal_json() {
+        // A report only writes what it has to say, so most days omit most
+        // fields. Reading one back has to give exactly what was written.
+        let report = real_month();
+        let json = report.to_json().unwrap();
+
+        // the empty maps this month is full of are not written at all
+        assert!(
+            !json.contains("\"reservation_jobs\":{}"),
+            "empty maps remain"
+        );
+        assert!(!json.contains("\"requeue_states\":{}"), "empty maps remain");
+        assert!(
+            !json.contains("\"requeue_wait_seconds\":0"),
+            "zero counters remain"
+        );
+
+        let reparsed = ProjectUsageReport::from_json(&json).unwrap();
+
+        assert_eq!(reparsed.total_usage(), report.total_usage());
+        assert_eq!(reparsed.total_requeue_usage(), report.total_requeue_usage());
+        assert_eq!(reparsed.num_jobs(), report.num_jobs());
+        assert_eq!(reparsed.total_wait_seconds(), report.total_wait_seconds());
+        assert_eq!(reparsed.num_requeue_events(), report.num_requeue_events());
+        assert_eq!(
+            reparsed.total_runtime_seconds(),
+            report.total_runtime_seconds()
+        );
+        assert_eq!(
+            reparsed.total_reservation_usage(),
+            report.total_reservation_usage()
+        );
+        assert_eq!(
+            reparsed.average_expansion_factor(),
+            report.average_expansion_factor()
+        );
+        assert_eq!(
+            reparsed.average_cpus_per_job(),
+            report.average_cpus_per_job()
+        );
+        assert_eq!(
+            reparsed.requeue_state_summary(),
+            report.requeue_state_summary()
+        );
+        assert_eq!(reparsed.dates(), report.dates());
+
+        // and writing it again gives the same document - compared as JSON rather
+        // than as bytes, because these are `HashMap`s and serde emits their keys
+        // in whatever order the map iterates
+        let first: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let again: serde_json::Value = serde_json::from_str(&reparsed.to_json().unwrap()).unwrap();
+
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn test_scaling_a_month_agrees_with_scaling_its_days() {
+        // `Usage` truncates to whole seconds, so scaling and summing are not in
+        // general interchangeable - but they are here, and for a reason worth
+        // recording: usage is only ever *stored* per user per day, and both
+        // paths scale those same stored values. Nothing is scaled after being
+        // summed, so there is no coarser value to lose a fraction of.
+        //
+        // A caller converting a month to credits and a caller converting each
+        // day therefore agree to the second, which is what makes a monthly
+        // invoice reconcilable against a daily breakdown.
+        let report = real_month();
+
+        let mut scaled_whole = report.clone();
+        scaled_whole.scale_total(0.5);
+
+        let mut scaled_days = DailyProjectUsageReport::default();
+        for date in report.dates() {
+            for day in report.get_report(&date).daily_reports(false) {
+                scaled_days += day / 2.0;
+            }
+        }
+
+        assert_eq!(
+            scaled_whole.total_usage().seconds(),
+            scaled_days.total_usage().seconds()
+        );
+
+        // Halving really did something, so the equality above is not vacuous.
+        // Doubling does not recover the original: each odd per-user-day value
+        // lost half a second, thirty-two of them across this month. That is the
+        // truncation - it just falls in the same place either way round.
+        let halved = scaled_whole.total_usage().seconds();
+        assert!(halved * 2 <= report.total_usage().seconds());
+        assert!(
+            report.total_usage().seconds() - halved * 2 < 100,
+            "the loss is bounded by one second per stored value"
+        );
+    }
+
+    #[test]
+    fn test_the_quick_reports_read_sensibly_over_real_data() {
+        let report = real_month();
+
+        let requeues = report.requeue_report();
+        assert!(requeues.contains("NODE_FAIL"), "{}", requeues);
+        assert!(requeues.contains("REQUEUED"), "{}", requeues);
+        // the month predates charging, so every one of its requeues is absorbed
+        assert!(
+            requeues.contains("12 absorbed requeue events, 0 charged"),
+            "{}",
+            requeues
+        );
+
+        let reservations = report.reservation_report();
+        assert!(reservations.contains("interactive"), "{}", reservations);
+        assert!(reservations.contains("82 jobs"), "{}", reservations);
+
+        let expansion = report.expansion_factor_report();
+        assert!(expansion.contains("357 jobs"), "{}", expansion);
+        // the mean is far above the overall figure on this month, so the report
+        // should say which end of the distribution waited
+        assert!(expansion.contains("*short* jobs"), "{}", expansion);
+        // The worst-served user is named first, ranked on the overall figure
+        // rather than the mean - "wait (h)" appears only in a column header, so
+        // the row after the first one is theirs. That is user6, who queued nine
+        // and a half hours for a job that ran thirty-four seconds, and not user1,
+        // whose enormous *mean* comes from a single freak job among ninety-two
+        // and whose overall figure is an unremarkable 3.49.
+        let first_row = expansion
+            .lines()
+            .skip_while(|line| !line.contains("wait (h)"))
+            .nth(1);
+        let Some(first_row) = first_row else {
+            unreachable!("no user rows in:\n{}", expansion);
+        };
+        assert!(first_row.contains("user6.project"), "{}", first_row);
+    }
+
+    #[test]
+    fn test_an_absent_is_complete_reads_as_incomplete() {
+        // `is_complete` is one of the three fields still written even when it
+        // has nothing to say, because release 0.92.0 cannot read a report
+        // without it. It now carries a `serde(default)` so that a later release
+        // can stop writing it - and the default has to be the safe direction.
+        //
+        // `false` is that direction: a report that does not say it is finished
+        // is treated as still being filled in. `op-slurm` refuses to cache an
+        // incomplete day and will fetch it again, and the printout marks it as
+        // incomplete, so the cost of guessing wrong is a repeated query. The
+        // other way round, a partial day would be cached as final and a
+        // project's usage silently understated for ever.
+        let without: DailyProjectUsageReport = serde_json::from_value(serde_json::json!({
+            "reports": { "alice": { "seconds": 3600 } }
+        }))
+        .unwrap();
+
+        assert!(!without.is_complete());
+        assert_eq!(without.total_usage(), Usage::new(3600));
+        assert!(without.to_string().contains("incomplete"));
+
+        // and a report that does say so is believed
+        let with: DailyProjectUsageReport = serde_json::from_value(serde_json::json!({
+            "reports": { "alice": { "seconds": 3600 } },
+            "is_complete": true
+        }))
+        .unwrap();
+
+        assert!(with.is_complete());
+        assert!(!with.to_string().contains("incomplete"));
+
+        // the real month has one day still being filled in, and it reads as such
+        let month = real_month();
+        let incomplete: Vec<Date> = month
+            .dates()
+            .into_iter()
+            .filter(|date| {
+                !month
+                    .get_report(date)
+                    .daily_reports(false)
+                    .iter()
+                    .all(|day| day.is_complete())
+            })
+            .collect();
+
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(
+            incomplete.first().map(|d| d.to_string()),
+            Some("2026-08-24".to_string())
+        );
+    }
+
+    #[test]
+    fn test_a_report_from_the_previous_release_still_reads_correctly() {
+        // Exactly what release 0.92.0 serialised - the fields it had, and none
+        // of the ones added since. Every new figure has to read as "not
+        // recorded" rather than as a value, and nothing it used to say may have
+        // changed.
+        let legacy = serde_json::json!({
+            "project": "proj.portal",
+            "users": { "alice.proj.portal": "alice" },
+            "reports": {
+                "2026-03-01": {
+                    "reports": { "alice": { "seconds": 7200 } },
+                    "components": {
+                        "cpu": { "alice": { "seconds": 921600 } },
+                        "gpu": { "alice": { "seconds": 28800 } }
+                    },
+                    "user_job_counts": { "alice": 4 },
+                    "user_wait_seconds": { "alice": 3600 },
+                    "num_jobs": 4,
+                    "total_wait_seconds": 3600,
+                    "is_complete": true
+                }
+            }
+        });
+
+        let report: ProjectUsageReport = serde_json::from_value(legacy).unwrap();
+
+        // everything it used to say, unchanged
+        assert_eq!(report.total_usage(), Usage::new(7200));
+        assert_eq!(report.num_jobs(), 4);
+        assert_eq!(report.total_wait_seconds(), 3600);
+        assert_eq!(report.average_wait_seconds(), 900);
+        assert_eq!(
+            report.components(),
+            vec!["cpu".to_string(), "gpu".to_string()]
+        );
+        assert_eq!(
+            report.get_component("cpu").total_usage(),
+            Usage::new(921600)
+        );
+
+        // every new figure reads as "nothing recorded"
+        assert_eq!(report.total_requeue_usage(), Usage::default());
+        assert_eq!(report.total_usage_including_requeues(), Usage::new(7200));
+        assert_eq!(report.num_requeue_events(), 0);
+        assert!(!report.has_requeues());
+        assert!(!report.has_reservations());
+        assert_eq!(report.usage_outside_reservations(), Usage::new(7200));
+        assert_eq!(report.total_runtime_seconds(), 0);
+        assert_eq!(report.average_expansion_factor(), 0.0);
+        assert_eq!(report.average_cpus_per_job(), 0.0);
+
+        // and the printed output must not turn those absences into claims. A
+        // legacy report's jobs did not run on zero cores, and they did not turn
+        // around instantly - on the classical scale 0.00 would read as better
+        // than perfect.
+        let printed = report.to_string();
+        assert!(!printed.contains("Mean job size"), "{}", printed);
+        assert!(!printed.contains("Expansion factor"), "{}", printed);
+
+        let dump = report.expansion_factor_report();
+        assert!(
+            dump.contains("No expansion factor or job size recorded"),
+            "{}",
+            dump
+        );
+        assert!(!dump.contains("0.00"), "{}", dump);
+
+        // the other quick reports say so in words rather than printing zeroes
+        assert!(report.requeue_report().contains("No requeued jobs"));
+        assert!(report.reservation_report().contains("No jobs ran inside"));
+    }
+
+    #[test]
+    fn test_what_we_emit_now_still_loads_into_a_reader_that_knows_only_the_old_fields() {
+        // The other direction: an older peer deserialising one of our reports
+        // ignores what it does not know, so nothing on the wire had to change.
+        #[derive(serde::Deserialize)]
+        struct OldDaily {
+            reports: HashMap<String, Usage>,
+            #[serde(default)]
+            num_jobs: u64,
+            #[serde(default)]
+            total_wait_seconds: u64,
+            is_complete: bool,
+        }
+
+        let mut modern = DailyProjectUsageReport::default();
+        modern.add_usage("alice", Usage::new(3600));
+        modern.add_jobs("alice", 1);
+        modern.add_wait_seconds("alice", 60);
+        modern.add_expansion("alice", 60, 3600);
+        modern.add_job_size("alice", 128, 4);
+        modern.add_requeue_usage("alice", Usage::new(600));
+        modern.add_requeue_events("alice", "NODE_FAIL", 1);
+        modern.add_reservation_usage("bench", "alice", Usage::new(1200));
+        modern.set_complete();
+
+        let old: OldDaily = serde_json::from_str(&serde_json::to_string(&modern).unwrap()).unwrap();
+
+        assert_eq!(old.num_jobs, 1);
+        assert_eq!(old.total_wait_seconds, 60);
+        assert_eq!(
+            old.reports.get("alice").cloned().unwrap_or_default(),
+            Usage::new(3600)
+        );
+        assert!(old.is_complete);
+    }
+
+    #[test]
+    fn test_a_day_with_no_size_data_shows_a_dash_not_a_zero() {
+        // Merging a legacy day with a recent one leaves rows with no expansion
+        // or size data, and zero is the sentinel for that - not a score.
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        let mut legacy_day = DailyProjectUsageReport::default();
+        legacy_day.add_usage("alice", Usage::new(3600));
+        legacy_day.add_jobs("alice", 1);
+        legacy_day.add_wait_seconds("alice", 60);
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &legacy_day);
+
+        let mut modern_day = DailyProjectUsageReport::default();
+        modern_day.add_usage("bob", Usage::new(3600));
+        modern_day.add_jobs("bob", 1);
+        modern_day.add_wait_seconds("bob", 60);
+        modern_day.add_expansion("bob", 60, 3600);
+        modern_day.add_job_size("bob", 128, 0);
+        report.set_report(&Date::parse("2026-03-02").unwrap(), &modern_day);
+
+        let dump = report.expansion_factor_report();
+
+        let legacy_row = dump
+            .lines()
+            .find(|line| line.trim_start().starts_with("2026-03-01"));
+        let Some(legacy_row) = legacy_row else {
+            unreachable!("no row for the legacy day in:\n{}", dump);
+        };
+
+        assert!(
+            legacy_row.contains('-'),
+            "the legacy day should show a dash: {}",
+            legacy_row
+        );
+        assert!(
+            !legacy_row.contains("0.00"),
+            "and not a zero: {}",
+            legacy_row
+        );
+
+        // while the modern day shows its real figures
+        let modern_row = dump
+            .lines()
+            .find(|line| line.trim_start().starts_with("2026-03-02"));
+        let Some(modern_row) = modern_row else {
+            unreachable!("no row for the modern day in:\n{}", dump);
+        };
+        assert!(modern_row.contains("1.02"), "{}", modern_row);
+        assert!(modern_row.contains("128.0"), "{}", modern_row);
+    }
+
+    #[test]
+    fn test_the_expansion_factor_is_the_mean_of_per_job_ratios() {
+        // Turnaround over runtime, per job, averaged - the classical form, so a
+        // job that never waited scores exactly 1.0. A mean of ratios rather than
+        // a ratio of sums, so that a job which queued for a long time and then
+        // exited quickly shows up instead of being swallowed.
+        let mut report = DailyProjectUsageReport::default();
+
+        // an hour's wait for an hour's work
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 3600);
+        report.add_expansion("alice", 3600, 3600);
+
+        // no wait at all
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 0);
+        report.add_expansion("alice", 0, 7200);
+
+        assert_eq!(report.num_jobs(), 2);
+        assert_eq!(report.total_runtime_seconds(), 10800);
+
+        // the first job doubled its own runtime waiting, the second waited not
+        // at all: (2.0 + 1.0) / 2
+        assert!((report.average_expansion_factor() - 1.5).abs() < 1e-9);
+
+        // 3600 waited plus 10800 run, over 10800 run - the same jobs, weighted
+        // by size
+        assert!((report.aggregate_expansion_factor() - (14400.0 / 10800.0)).abs() < 1e-9);
+
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_a_long_wait_for_a_job_that_dies_immediately_is_visible() {
+        // The case the statistic exists for: a user fighting a job that will not
+        // run. Two hours queued, four seconds of work, over and over.
+        let mut struggling = DailyProjectUsageReport::default();
+
+        for _ in 0..5 {
+            struggling.add_jobs("alice", 1);
+            struggling.add_wait_seconds("alice", 7200);
+            struggling.add_expansion("alice", 7200, 4);
+        }
+
+        // 7204 seconds of turnaround for 4 of work: 1801, and loud
+        assert!((struggling.average_expansion_factor() - 1801.0).abs() < 0.01);
+
+        // and it survives being averaged with a well-behaved day, which is the
+        // reason for preferring the mean of ratios: the aggregate form would
+        // bury these five jobs under one long-running one
+        let mut healthy = DailyProjectUsageReport::default();
+        healthy.add_jobs("bob", 1);
+        healthy.add_wait_seconds("bob", 60);
+        healthy.add_expansion("bob", 60, 86400);
+
+        let combined = struggling + healthy;
+
+        assert!(
+            combined.average_expansion_factor() > 1000.0,
+            "the mean of ratios must still show it: {}",
+            combined.average_expansion_factor()
+        );
+        assert!(
+            combined.aggregate_expansion_factor() < 1.5,
+            "while the aggregate form buries it, close to the ideal 1.0: {}",
+            combined.aggregate_expansion_factor()
+        );
+
+        // per user is where you look to find who it was
+        assert!(combined.expansion_factor_for_user("alice") > 1000.0);
+        assert!(combined.expansion_factor_for_user("bob") < 1.01);
+        assert!(combined.is_consistent());
+    }
+
+    /// A project with three users of deliberately different habits: one running
+    /// a few large jobs and well served, one running many small ones, and one
+    /// fighting a job that will not run.
+    fn project_report_with_mixed_habits() -> ProjectUsageReport {
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        let mut day = DailyProjectUsageReport::default();
+
+        for _ in 0..4 {
+            day.add_usage("alice", Usage::new(3600 * 128));
+            day.add_jobs("alice", 1);
+            day.add_wait_seconds("alice", 900);
+            day.add_expansion("alice", 900, 7200);
+            day.add_job_size("alice", 512, 16);
+        }
+
+        for _ in 0..120 {
+            day.add_usage("carol", Usage::new(600));
+            day.add_jobs("carol", 1);
+            day.add_wait_seconds("carol", 300);
+            day.add_expansion("carol", 300, 600);
+            day.add_job_size("carol", 2, 0);
+        }
+
+        for _ in 0..6 {
+            day.add_usage("bob", Usage::new(30));
+            day.add_jobs("bob", 1);
+            day.add_wait_seconds("bob", 9000);
+            day.add_expansion("bob", 9000, 30);
+            day.add_job_size("bob", 64, 4);
+        }
+
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &day);
+        report
+    }
+
+    #[test]
+    fn test_the_expansion_report_names_the_user_who_is_struggling() {
+        // The per-user table is the point of the report: the project-wide mean
+        // job size here is about 20 cores, which describes none of these three.
+        let report = project_report_with_mixed_habits();
+        let dump = report.expansion_factor_report();
+
+        // worst-served first, so the user in trouble is the row after the first
+        // column header - "wait (h)" appears only in a header
+        let Some(worst) = dump
+            .lines()
+            .skip_while(|line| !line.contains("wait (h)"))
+            .nth(1)
+        else {
+            unreachable!("no per-user rows in:\n{}", dump);
+        };
+
+        assert!(worst.contains("bob"), "bob should be first: {}", worst);
+        assert!(worst.contains("301.00"), "{}", worst);
+
+        // and every user appears with their own job shape
+        assert!(dump.contains("512.0"), "alice's job size: {}", dump);
+        assert!(
+            dump.contains("180") || dump.contains("120"),
+            "carol's jobs: {}",
+            dump
+        );
+    }
+
+    #[test]
+    fn test_the_user_table_shows_the_runtime_that_gives_a_wait_its_meaning() {
+        // A wait says nothing on its own. In this real month two users look
+        // similar on wait alone and are telling completely different stories:
+        // one queued 27.7 hours for a job that ran 17.6 hours, which is a busy
+        // queue; the other queued 9.5 hours for a job that ran 32 seconds,
+        // which is somebody fighting a job that will not start. The expansion
+        // factor already separates them - 2.91 against 1004 - and the runtime
+        // column is what makes that legible rather than mysterious.
+        let report = real_month();
+
+        assert_eq!(
+            report.average_runtime_seconds_for_user("user3.project"),
+            63_308
+        );
+        assert_eq!(
+            report.average_wait_seconds_for_user("user3.project"),
+            99_652
+        );
+
+        assert_eq!(report.average_runtime_seconds_for_user("user6.project"), 34);
+        assert_eq!(
+            report.average_wait_seconds_for_user("user6.project"),
+            34_109
+        );
+
+        // the whole project, for the headline
+        assert_eq!(report.average_runtime_seconds(), 5_788);
+        assert_eq!(report.average_wait_seconds(), 14_809);
+
+        let dump = report.expansion_factor_report();
+
+        // both columns are labelled once, in hours, rather than on every row
+        assert!(dump.contains("run (h)"), "{}", dump);
+        assert!(dump.contains("wait (h)"), "{}", dump);
+        assert!(dump.contains("mean runtime"), "{}", dump);
+
+        // and the two rows above are there to be compared
+        let row_for = |user: &str| {
+            dump.lines()
+                .find(|line| line.starts_with(&format!("  {}", user)))
+                .map(|line| line.to_string())
+        };
+
+        let Some(patient) = row_for("user3.project") else {
+            unreachable!("no row for user3 in:\n{}", dump);
+        };
+        let Some(struggling) = row_for("user6.project") else {
+            unreachable!("no row for user6 in:\n{}", dump);
+        };
+
+        assert!(
+            patient.contains("17.586") && patient.contains("27.681"),
+            "{}",
+            patient
+        );
+        assert!(
+            struggling.contains("0.009") && struggling.contains("9.475"),
+            "{}",
+            struggling
+        );
+    }
+
+    #[test]
+    fn test_the_pair_of_expansion_columns_separates_three_different_stories() {
+        // One figure cannot distinguish "a few jobs waited forever and then died"
+        // from "this user simply waits", and an operator scanning the table needs
+        // to. The real month has all three shapes in it.
+        let report = real_month();
+
+        // user1: a mean two thousand times the overall figure. 85% of that mean
+        // comes from three days, and on the worst of them the day's own totals
+        // leave only one possibility - a job that queued for about three days
+        // and then ran for one second. One job in ninety-two is 40% of the mean.
+        assert!((report.expansion_factor_for_user("user1.project") - 7_290.137).abs() < 0.01);
+        assert!((report.aggregate_expansion_factor_for_user("user1.project") - 3.495).abs() < 0.01);
+
+        // user6: one job, so a mean of ratios and a ratio of totals are the same
+        // arithmetic. Nine hours of queueing for a job that ran 34 seconds.
+        assert_eq!(report.num_jobs_for_user("user6.project"), 1);
+        assert!(
+            (report.expansion_factor_for_user("user6.project")
+                - report.aggregate_expansion_factor_for_user("user6.project"))
+            .abs()
+                < 0.01
+        );
+
+        // user5: the other direction - the mean is *below* the overall figure, so
+        // the waiting fell on the longer jobs rather than the short ones
+        assert!(
+            report.expansion_factor_for_user("user5.project")
+                < report.aggregate_expansion_factor_for_user("user5.project"),
+            "user5's waiting should sit on the long jobs"
+        );
+
+        // user8: served immediately, and both figures say so
+        assert!((report.expansion_factor_for_user("user8.project") - 1.002).abs() < 0.01);
+        assert!((report.aggregate_expansion_factor_for_user("user8.project") - 1.001).abs() < 0.01);
+
+        // all of which has to be legible in the row, side by side
+        let dump = report.expansion_factor_report();
+        let row_for = |user: &str| {
+            dump.lines()
+                .find(|line| line.starts_with(&format!("  {}", user)))
+                .map(|line| line.to_string())
+        };
+
+        let Some(row) = row_for("user1.project") else {
+            unreachable!("no row for user1 in:\n{}", dump);
+        };
+        assert!(row.contains("7290.14") && row.contains("3.49"), "{}", row);
+
+        // and the day table carries the same pair, so a day where the gap opens
+        // up can be spotted - 2026-08-05 is the one
+        let worst_day = dump.lines().find(|line| line.starts_with("  2026-08-05"));
+        let Some(worst_day) = worst_day else {
+            unreachable!("no row for 2026-08-05 in:\n{}", dump);
+        };
+        assert!(
+            worst_day.contains("16075.49") && worst_day.contains("10.35"),
+            "{}",
+            worst_day
+        );
+    }
+
+    #[test]
+    fn test_a_user_with_no_runtime_recorded_shows_a_dash_for_it() {
+        // A legacy day carries wait and job counts but no runtime, and zero is
+        // the sentinel for "not recorded" - a mean runtime of 0.000 hours would
+        // read as a job that took no time at all.
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        let mut legacy = DailyProjectUsageReport::default();
+        legacy.add_usage("alice", Usage::new(3600));
+        legacy.add_jobs("alice", 1);
+        legacy.add_wait_seconds("alice", 7200);
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &legacy);
+
+        let mut modern = DailyProjectUsageReport::default();
+        modern.add_usage("bob", Usage::new(3600));
+        modern.add_jobs("bob", 1);
+        modern.add_wait_seconds("bob", 1800);
+        modern.add_expansion("bob", 1800, 3600);
+        modern.add_job_size("bob", 128, 0);
+        report.set_report(&Date::parse("2026-03-02").unwrap(), &modern);
+
+        let dump = report.expansion_factor_report();
+
+        let row = dump
+            .lines()
+            .find(|line| line.starts_with("  alice"))
+            .map(|line| line.to_string());
+        let Some(row) = row else {
+            unreachable!("no row for alice in:\n{}", dump);
+        };
+
+        // the wait it does know is shown; the runtime it does not is a dash
+        assert!(row.contains("2.000"), "the wait is known: {}", row);
+        assert!(row.contains('-'), "the runtime is not: {}", row);
+        assert!(!row.contains("0.000"), "and is not shown as zero: {}", row);
+    }
+
+    #[test]
+    fn test_the_expansion_report_explains_which_end_of_the_distribution_waited() {
+        // The gap between the two forms is the most useful thing in the report,
+        // so it is spelled out rather than left to be spotted.
+        let struggling = project_report_with_mixed_habits();
+        let dump = struggling.expansion_factor_report();
+
+        assert!(
+            dump.contains("some *short* jobs waited a"),
+            "a mean far above the aggregate should be called out: {}",
+            dump
+        );
+
+        // the opposite case: one long job that waited, and nothing else
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut contended = ProjectUsageReport::new(&project);
+        let mut day = DailyProjectUsageReport::default();
+
+        day.add_jobs("alice", 1);
+        day.add_wait_seconds("alice", 86400);
+        day.add_expansion("alice", 86400, 86400);
+        day.add_job_size("alice", 128, 0);
+
+        for _ in 0..50 {
+            day.add_jobs("carol", 1);
+            day.add_wait_seconds("carol", 0);
+            day.add_expansion("carol", 0, 60);
+            day.add_job_size("carol", 1, 0);
+        }
+
+        contended.set_report(&Date::parse("2026-03-01").unwrap(), &day);
+        let dump = contended.expansion_factor_report();
+
+        assert!(
+            dump.contains("*long* jobs"),
+            "an aggregate far above the mean should be called out: {}",
+            dump
+        );
+    }
+
+    #[test]
+    fn test_the_expansion_report_says_nothing_when_there_is_nothing_to_explain() {
+        // A well-served project gets the figures and no commentary. The
+        // comparison is between the excesses over 1.0, not the raw values: on
+        // this scale 1.0 means "waited not at all", so 1.02 against 1.04 is a
+        // doubling of nothing and must not be announced as a pattern.
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+        let mut day = DailyProjectUsageReport::default();
+
+        for _ in 0..20 {
+            day.add_jobs("alice", 1);
+            day.add_wait_seconds("alice", 30);
+            day.add_expansion("alice", 30, 3600);
+            day.add_job_size("alice", 128, 0);
+        }
+
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &day);
+        let dump = report.expansion_factor_report();
+
+        assert!(!dump.contains("*short* jobs"), "{}", dump);
+        assert!(!dump.contains("*long* jobs"), "{}", dump);
+
+        // but the figures themselves are still there
+        assert!(dump.contains("20 jobs"), "{}", dump);
+        assert!(dump.contains("128.0"), "{}", dump);
+    }
+
+    #[test]
+    fn test_the_expansion_report_is_one_line_when_no_jobs_ran() {
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let report = ProjectUsageReport::new(&project);
+
+        assert!(report
+            .expansion_factor_report()
+            .contains("No jobs recorded"));
+        assert!(!report
+            .expansion_factor_report()
+            .contains("expansion factor 0"));
+    }
+
+    #[test]
+    fn test_the_expansion_report_shows_each_day_so_a_change_is_visible() {
+        // When the trouble started is as useful as who caused it.
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        let mut quiet = DailyProjectUsageReport::default();
+        quiet.add_jobs("alice", 1);
+        quiet.add_expansion("alice", 0, 3600);
+        quiet.add_job_size("alice", 128, 0);
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &quiet);
+
+        let mut bad = DailyProjectUsageReport::default();
+        bad.add_jobs("alice", 1);
+        bad.add_wait_seconds("alice", 36000);
+        bad.add_expansion("alice", 36000, 60);
+        bad.add_job_size("alice", 128, 0);
+        report.set_report(&Date::parse("2026-03-02").unwrap(), &bad);
+
+        let dump = report.expansion_factor_report();
+
+        assert!(dump.contains("2026-03-01"), "{}", dump);
+        assert!(dump.contains("2026-03-02"), "{}", dump);
+
+        // the quiet day is 1.00 and the bad one is not
+        let day_rows: Vec<&str> = dump
+            .lines()
+            .filter(|line| line.trim_start().starts_with("2026-03-"))
+            .collect();
+
+        assert_eq!(day_rows.len(), 2);
+        assert!(day_rows[0].contains("1.00"), "{}", day_rows[0]);
+        assert!(day_rows[1].contains("601.00"), "{}", day_rows[1]);
+    }
+
+    #[test]
+    fn test_mean_job_size_distinguishes_many_small_jobs_from_a_few_large_ones() {
+        // The distinction usage cannot draw. Both of these projects consumed the
+        // same core-seconds; one ran a single wide job and the other ran a
+        // hundred narrow ones.
+        let mut wide = DailyProjectUsageReport::default();
+        wide.add_usage("alice", Usage::new(3600 * 128));
+        wide.add_jobs("alice", 1);
+        wide.add_expansion("alice", 0, 3600);
+        wide.add_job_size("alice", 128, 4);
+
+        let mut narrow = DailyProjectUsageReport::default();
+        for _ in 0..128 {
+            narrow.add_usage("bob", Usage::new(3600));
+            narrow.add_jobs("bob", 1);
+            narrow.add_expansion("bob", 0, 3600);
+            narrow.add_job_size("bob", 1, 0);
+        }
+
+        // indistinguishable by usage...
+        assert_eq!(wide.total_usage(), narrow.total_usage());
+
+        // ...and plainly different by job size
+        assert_eq!(wide.average_cpus_per_job(), 128.0);
+        assert_eq!(wide.average_gpus_per_job(), 4.0);
+        assert_eq!(narrow.average_cpus_per_job(), 1.0);
+        assert_eq!(narrow.average_gpus_per_job(), 0.0);
+
+        assert!(wide.is_consistent());
+        assert!(narrow.is_consistent());
+    }
+
+    #[test]
+    fn test_job_size_is_unweighted_by_runtime() {
+        // Each job counts once however long it ran, because the question is what
+        // shape the jobs were - not what the machine was occupied by, which is
+        // what the usage components already answer.
+        let mut report = DailyProjectUsageReport::default();
+
+        // one enormous job that ran for a minute
+        report.add_jobs("alice", 1);
+        report.add_expansion("alice", 0, 60);
+        report.add_job_size("alice", 512, 16);
+
+        // and one small job that ran for a day
+        report.add_jobs("alice", 1);
+        report.add_expansion("alice", 0, 86400);
+        report.add_job_size("alice", 2, 0);
+
+        // (512 + 2) / 2 - the day-long job does not dominate
+        assert_eq!(report.average_cpus_per_job(), 257.0);
+        assert_eq!(report.average_gpus_per_job(), 8.0);
+    }
+
+    #[test]
+    fn test_mean_job_size_is_per_user_and_per_project_over_every_job() {
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        let mut busy = DailyProjectUsageReport::default();
+        for _ in 0..9 {
+            busy.add_jobs("alice", 1);
+            busy.add_job_size("alice", 4, 0);
+        }
+        busy.add_jobs("bob", 1);
+        busy.add_job_size("bob", 256, 8);
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &busy);
+
+        let mut quiet = DailyProjectUsageReport::default();
+        quiet.add_jobs("alice", 1);
+        quiet.add_job_size("alice", 4, 0);
+        report.set_report(&Date::parse("2026-03-02").unwrap(), &quiet);
+
+        // ten four-core jobs and one 256-core job, over eleven jobs
+        assert_eq!(report.num_jobs(), 11);
+        assert!((report.average_cpus_per_job() - (296.0 / 11.0)).abs() < 1e-9);
+
+        // and per user, which is where the outlier is
+        assert_eq!(report.average_cpus_per_job_for_user("alice"), 4.0);
+        assert_eq!(report.average_cpus_per_job_for_user("bob"), 256.0);
+        assert_eq!(report.average_gpus_per_job_for_user("bob"), 8.0);
+        assert_eq!(report.average_cpus_per_job_for_user("nobody"), 0.0);
+    }
+
+    #[test]
+    fn test_job_sizes_survive_merging_renaming_and_scaling() {
+        let mut day = DailyProjectUsageReport::default();
+        day.add_usage("alice", Usage::new(3600));
+        day.add_jobs("alice", 2);
+        day.add_job_size("alice", 64, 4);
+
+        let mut merged = day.clone();
+        merged += day.clone();
+
+        assert_eq!(merged.total_allocated_cpus(), 128);
+        assert_eq!(merged.total_allocated_gpus(), 8);
+        assert_eq!(merged.num_jobs(), 4);
+        assert_eq!(merged.average_cpus_per_job(), 32.0);
+        assert!(merged.is_consistent());
+
+        // a credit conversion does not change how many cores a job held
+        let scaled = day.clone() * 100.0;
+        assert_eq!(scaled.total_allocated_cpus(), 64);
+        assert_eq!(scaled.average_cpus_per_job(), day.average_cpus_per_job());
+
+        let mut renamed = day.clone();
+        let mut renames = HashMap::new();
+        renames.insert("alice".to_string(), "alice2".to_string());
+        renamed.remap_local_users(&renames);
+
+        assert_eq!(renamed.allocated_cpus_for_user("alice2"), 64);
+        assert_eq!(renamed.allocated_cpus_for_user("alice"), 0);
+        assert_eq!(renamed.average_cpus_per_job_for_user("alice2"), 32.0);
+        assert!(renamed.is_consistent());
+    }
+
+    #[test]
+    fn test_a_report_from_an_instance_without_job_sizes_still_loads() {
+        let legacy = serde_json::json!({
+            "reports": { "alice": { "seconds": 1800 } },
+            "num_jobs": 1,
+            "is_complete": true
+        });
+
+        let report: DailyProjectUsageReport = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(report.total_allocated_cpus(), 0);
+        assert_eq!(report.average_cpus_per_job(), 0.0);
+        assert_eq!(report.average_gpus_per_job(), 0.0);
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_a_job_that_never_waited_scores_exactly_one() {
+        // The classical convention: 1.0 is the ideal, not 0.0. Reading it the
+        // other way round would make a perfectly served project look like a
+        // badly served one.
+        let mut report = DailyProjectUsageReport::default();
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 0);
+        report.add_expansion("alice", 0, 3600);
+
+        assert_eq!(report.average_expansion_factor(), 1.0);
+        assert_eq!(report.aggregate_expansion_factor(), 1.0);
+
+        // and a job that waited as long as it ran scores 2.0
+        let mut report = DailyProjectUsageReport::default();
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 3600);
+        report.add_expansion("alice", 3600, 3600);
+
+        assert_eq!(report.average_expansion_factor(), 2.0);
+        assert_eq!(report.aggregate_expansion_factor(), 2.0);
+    }
+
+    #[test]
+    fn test_a_job_with_no_runtime_recorded_is_left_out_of_the_denominator() {
+        // The runtime and expansion sums are accumulated over the jobs that
+        // have a runtime to contribute, so they have to be averaged over that
+        // same population. Dividing by `num_jobs` averaged a sum over jobs it
+        // was never summed across, dragging both means towards zero in
+        // proportion to how many jobs were still running when the window
+        // closed.
+        let mut report = DailyProjectUsageReport::default();
+
+        // two jobs that each waited exactly as long as they ran, so the honest
+        // expansion factor is 2.00
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 600);
+        report.add_expansion("alice", 600, 600);
+
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 1800);
+        report.add_expansion("alice", 1800, 1800);
+
+        // and a third whose runtime is not known - counted as a job, with no
+        // runtime and no ratio to contribute
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 900);
+
+        assert_eq!(report.num_jobs(), 3);
+        assert_eq!(report.expansion_jobs(), 2);
+        assert_eq!(report.expansion_jobs_for_user("alice"), 2);
+
+        assert_eq!(report.average_expansion_factor(), 2.0);
+        assert_eq!(report.expansion_factor_for_user("alice"), 2.0);
+        assert_eq!(report.average_runtime_seconds(), 1200);
+        assert_eq!(report.average_runtime_seconds_for_user("alice"), 1200);
+
+        // the wait is still averaged over every job, because every job has one
+        assert_eq!(report.average_wait_seconds(), 1100);
+
+        assert!(report.is_consistent());
+
+        // and the same over a project made of such days
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut month = ProjectUsageReport::new(&project);
+        month.set_report(&Date::parse("2026-03-01").unwrap(), &report);
+        month.set_report(&Date::parse("2026-03-02").unwrap(), &report);
+
+        assert_eq!(month.num_jobs(), 6);
+        assert_eq!(month.expansion_jobs(), 4);
+        assert_eq!(month.average_expansion_factor(), 2.0);
+        assert_eq!(month.average_runtime_seconds(), 1200);
+    }
+
+    #[test]
+    fn test_a_report_without_the_expansion_denominator_falls_back_to_the_job_count() {
+        // A report written before the denominator was counted has the sums but
+        // not the count they were summed over. Those two populations were the
+        // same by construction, so the job count is the right answer there -
+        // and the figure must not silently become zero on upgrade.
+        let mut report = DailyProjectUsageReport::default();
+        report.add_jobs("alice", 2);
+        report.add_wait_seconds("alice", 1200);
+        report.add_expansion("alice", 600, 600);
+        report.add_expansion("alice", 600, 600);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("user_expansion_jobs");
+        object.remove("num_expansion_jobs");
+
+        let legacy: DailyProjectUsageReport =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        assert_eq!(legacy.expansion_jobs(), 2);
+        assert_eq!(legacy.expansion_jobs_for_user("alice"), 2);
+        assert_eq!(legacy.average_expansion_factor(), 2.0);
+        assert_eq!(legacy.average_runtime_seconds(), 600);
+        assert!(legacy.is_consistent());
+    }
+
+    #[test]
+    fn test_a_job_with_no_runtime_cannot_divide_by_zero() {
+        // `op-slurm` does not report jobs that consumed nothing, so this should
+        // never arise - but a division by zero here would abort the process, and
+        // the values come from a peer.
+        let mut report = DailyProjectUsageReport::default();
+        report.add_jobs("alice", 1);
+        report.add_expansion("alice", 3600, 0);
+
+        assert_eq!(report.total_runtime_seconds(), 0);
+        assert_eq!(report.average_expansion_factor(), 0.0);
+        assert_eq!(report.aggregate_expansion_factor(), 0.0);
+
+        // An empty report is 0.0 rather than a NaN. Note that 0.0 is the
+        // no-jobs sentinel and not a score - on the classical scale no real job
+        // can be below 1.0, so the two cannot be confused.
+        let empty = DailyProjectUsageReport::default();
+        assert_eq!(empty.average_expansion_factor(), 0.0);
+        assert_eq!(empty.aggregate_expansion_factor(), 0.0);
+    }
+
+    #[test]
+    fn test_expansion_sums_are_order_independent() {
+        // Accumulated as thousandths precisely so that merging the same reports
+        // in a different order gives the same answer - these reports are merged
+        // out of HashMaps whose iteration order is arbitrary, and float addition
+        // is not associative.
+        let day = |wait: u64, run: u64| {
+            let mut report = DailyProjectUsageReport::default();
+            report.add_jobs("alice", 1);
+            report.add_wait_seconds("alice", wait);
+            report.add_expansion("alice", wait, run);
+            report
+        };
+
+        let forwards = day(1, 3) + day(2, 7) + day(5, 11);
+        let backwards = day(5, 11) + day(2, 7) + day(1, 3);
+
+        assert_eq!(
+            forwards.total_expansion_milli(),
+            backwards.total_expansion_milli()
+        );
+        assert_eq!(
+            forwards.average_expansion_factor(),
+            backwards.average_expansion_factor()
+        );
+    }
+
+    #[test]
+    fn test_a_projects_expansion_factor_weighs_every_job_not_every_day() {
+        // Averaging each day's average would let a day with one job weigh as
+        // heavily as a day with a hundred.
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        let mut busy = DailyProjectUsageReport::default();
+        for _ in 0..99 {
+            busy.add_jobs("alice", 1);
+            busy.add_wait_seconds("alice", 0);
+            busy.add_expansion("alice", 0, 3600);
+        }
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &busy);
+
+        let mut quiet = DailyProjectUsageReport::default();
+        quiet.add_jobs("alice", 1);
+        quiet.add_wait_seconds("alice", 3600);
+        quiet.add_expansion("alice", 3600, 3600);
+        report.set_report(&Date::parse("2026-03-02").unwrap(), &quiet);
+
+        // ninety-nine jobs scored 1.0 and one scored 2.0, so the mean is 1.01
+        assert_eq!(report.num_jobs(), 100);
+        assert!((report.average_expansion_factor() - 1.01).abs() < 1e-9);
+
+        // not 1.5, which is what averaging the two daily means would give
+        assert!(report.average_expansion_factor() < 1.1);
+    }
+
+    #[test]
+    fn test_scaling_usage_leaves_the_expansion_factor_alone() {
+        // A credit conversion rescales usage. It does not change how many jobs
+        // ran, how long they queued, or a dimensionless ratio of the two.
+        let mut report = DailyProjectUsageReport::default();
+        report.add_usage("alice", Usage::new(3600));
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 1800);
+        report.add_expansion("alice", 1800, 3600);
+
+        let scaled = report.clone() * 10.0;
+
+        assert_eq!(scaled.total_usage(), Usage::new(36000));
+        assert_eq!(scaled.total_runtime_seconds(), 3600);
+        assert_eq!(
+            scaled.average_expansion_factor(),
+            report.average_expansion_factor()
+        );
+
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut project_report = ProjectUsageReport::new(&project);
+        project_report.set_report(&Date::parse("2026-03-01").unwrap(), &report);
+        project_report.scale_total(0.5);
+
+        assert!((project_report.average_expansion_factor() - 1.5).abs() < 1e-9);
+        assert_eq!(project_report.total_runtime_seconds(), 3600);
+    }
+
+    #[test]
+    fn test_a_report_from_an_instance_without_expansion_factors_still_loads() {
+        let legacy = serde_json::json!({
+            "reports": { "alice": { "seconds": 1800 } },
+            "num_jobs": 1,
+            "total_wait_seconds": 60,
+            "is_complete": true
+        });
+
+        let report: DailyProjectUsageReport = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(report.total_runtime_seconds(), 0);
+        assert_eq!(report.average_expansion_factor(), 0.0);
+        assert!(report.is_consistent());
+    }
+
+    /// A two-day project report: one day with requeues, one without.
+    fn project_report_with_requeues() -> ProjectUsageReport {
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &report_with_requeues());
+
+        let mut quiet_day = DailyProjectUsageReport::default();
+        quiet_day.add_usage("alice", Usage::new(3600));
+        quiet_day.add_jobs("alice", 1);
+        report.set_report(&Date::parse("2026-03-02").unwrap(), &quiet_day);
+
+        report
+    }
+
+    /// A day with usage inside two reservations and some outside them.
+    fn report_with_reservations() -> DailyProjectUsageReport {
+        let mut report = report_with_requeues();
+
+        // of alice's 1800 reported and 7200 discarded seconds, some ran inside
+        // `bench`; bob's 600 ran inside `maint`
+        report.add_reservation_usage("bench", "alice", Usage::new(1200));
+        report.add_reservation_usage("bench", "alice", Usage::new(4800));
+        report.add_reservation_requeue_usage("bench", "alice", Usage::new(4800));
+        report.add_reservation_jobs("bench", 1);
+
+        report.add_reservation_usage("maint", "bob", Usage::new(600));
+        report.add_reservation_jobs("maint", 1);
+
+        report
+    }
+
+    #[test]
+    fn test_reservation_usage_is_a_subset_of_consumption_not_a_partition_of_it() {
+        // Most jobs run outside a reservation, so these figures account for part
+        // of a day rather than all of it - and they count superseded attempts,
+        // so the part they account for is of the true total, not the reported
+        // one.
+        let report = report_with_reservations();
+
+        assert_eq!(report.reservation_usage("bench"), Usage::new(6000));
+        assert_eq!(report.reservation_requeue_usage("bench"), Usage::new(4800));
+        assert_eq!(report.reservation_usage("maint"), Usage::new(600));
+        assert_eq!(report.total_reservation_usage(), Usage::new(6600));
+
+        assert_eq!(
+            report.total_reservation_usage() + report.usage_outside_reservations(),
+            report.total_usage_including_requeues()
+        );
+
+        assert_eq!(
+            report.reservation_usage_for_user("bench", "alice"),
+            Usage::new(6000)
+        );
+        assert_eq!(report.reservation_users("bench"), vec!["alice".to_string()]);
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_dividing_a_report_does_not_break_the_reservation_invariant() {
+        // `Usage` truncates to whole seconds, and truncation is not
+        // distributive over a sum: floor(1/2) + floor(1/2) is 0, while
+        // floor(2/2) is 1. The discarded share used to be keyed by reservation
+        // alone while the reservation's own usage was keyed by reservation and
+        // user, so dividing a report floored one side into more pieces than the
+        // other and the subset came out larger than the set - a report that had
+        // simply been converted into credits then failed its own consistency
+        // check. Both maps are now keyed the same way, so the same divisor
+        // floors both sides identically.
+        let mut report = DailyProjectUsageReport::default();
+
+        report.add_usage("alice", Usage::new(1));
+        report.add_usage("bob", Usage::new(1));
+        report.add_requeue_usage("alice", Usage::new(1));
+        report.add_requeue_usage("bob", Usage::new(1));
+
+        report.add_reservation_usage("bench", "alice", Usage::new(1));
+        report.add_reservation_usage("bench", "bob", Usage::new(1));
+        report.add_reservation_requeue_usage("bench", "alice", Usage::new(1));
+        report.add_reservation_requeue_usage("bench", "bob", Usage::new(1));
+
+        assert!(report.is_consistent());
+
+        // every divisor that splits these entries awkwardly, not just one
+        for divisor in [2.0, 3.0, 7.0, 1000.0] {
+            let divided = report.clone() / divisor;
+            assert!(
+                divided.is_consistent(),
+                "dividing by {} broke the invariant",
+                divisor
+            );
+            assert!(
+                divided.reservation_requeue_usage("bench").seconds()
+                    <= divided.reservation_usage("bench").seconds()
+            );
+        }
+
+        // and scaling up, which truncates too
+        for factor in [1.5, 2.5, 0.3] {
+            let scaled = report.clone() * factor;
+            assert!(
+                scaled.is_consistent(),
+                "scaling by {} broke the invariant",
+                factor
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_report_claiming_more_reservation_usage_than_it_consumed_is_inconsistent() {
+        // The one invariant available: reservations account for a subset, so
+        // usage inside them exceeding everything consumed means a record was
+        // counted twice.
+        let mut report = DailyProjectUsageReport::default();
+        report.add_usage("alice", Usage::new(600));
+        report.add_reservation_usage("bench", "alice", Usage::new(6000));
+
+        assert!(!report.is_consistent());
+
+        // and a discarded share larger than the reservation's own usage
+        let mut report = DailyProjectUsageReport::default();
+        report.add_usage("alice", Usage::new(6000));
+        report.add_reservation_usage("bench", "alice", Usage::new(600));
+        report.add_reservation_requeue_usage("bench", "alice", Usage::new(6000));
+
+        assert!(!report.is_consistent());
+    }
+
+    #[test]
+    fn test_reservation_figures_survive_merging_scaling_and_renaming() {
+        let mut merged = report_with_reservations();
+        merged += report_with_reservations();
+
+        assert_eq!(merged.reservation_usage("bench"), Usage::new(12000));
+        assert_eq!(merged.reservation_requeue_usage("bench"), Usage::new(9600));
+        assert_eq!(merged.reservation_jobs("bench"), 2);
+        assert!(merged.is_consistent());
+
+        // scaled with the totals, never apart from them - a client converts to
+        // credits and then compares the two
+        let doubled = report_with_reservations() * 2.0;
+        assert_eq!(doubled.reservation_usage("bench"), Usage::new(12000));
+        assert_eq!(doubled.total_usage(), Usage::new(4800));
+
+        let mut renamed = report_with_reservations();
+        let mut renames = HashMap::new();
+        renames.insert("alice".to_string(), "alice2".to_string());
+        renamed.remap_local_users(&renames);
+
+        assert_eq!(
+            renamed.reservation_usage_for_user("bench", "alice2"),
+            Usage::new(6000)
+        );
+        assert_eq!(
+            renamed.reservation_usage_for_user("bench", "alice"),
+            Usage::default()
+        );
+        // the reservation itself is not a user and keeps its name
+        assert_eq!(renamed.reservation_usage("bench"), Usage::new(6000));
+    }
+
+    #[test]
+    fn test_a_report_from_an_instance_without_reservations_still_loads() {
+        let legacy = serde_json::json!({
+            "reports": { "alice": { "seconds": 1800 } },
+            "num_jobs": 1,
+            "is_complete": true
+        });
+
+        let report: DailyProjectUsageReport = serde_json::from_value(legacy).unwrap();
+
+        assert!(!report.has_reservations());
+        assert_eq!(report.total_reservation_usage(), Usage::default());
+        assert_eq!(report.usage_outside_reservations(), Usage::new(1800));
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_the_reservation_report_says_what_went_in_and_not_how_full_it_was() {
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+        report.set_report(
+            &Date::parse("2026-03-01").unwrap(),
+            &report_with_reservations(),
+        );
+
+        let dump = report.reservation_report();
+
+        assert!(dump.contains("Consumed inside reservations"));
+        assert!(dump.contains("Consumed outside reservations"));
+
+        // busiest first
+        assert!(dump.find("bench") < dump.find("maint"), "{}", dump);
+
+        // the discarded share is called out, since it went into the reservation
+        // but is not in the usage we report
+        assert!(dump.contains("discarded by requeues"), "{}", dump);
+
+        // and the report is explicit about the question it cannot answer, so
+        // nobody reads these shares as utilisation
+        assert!(
+            dump.contains("is a property of the reservation"),
+            "the report must not be mistaken for utilisation: {}",
+            dump
+        );
+    }
+
+    #[test]
+    fn test_the_reservation_report_is_one_line_when_nothing_was_reserved() {
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &report_with_requeues());
+
+        assert!(!report.has_reservations());
+        assert!(report
+            .reservation_report()
+            .contains("No jobs ran inside a reservation"));
+    }
+
+    #[test]
+    fn test_the_requeue_report_says_what_was_lost_and_what_did_the_interrupting() {
+        let report = project_report_with_requeues();
+        let dump = report.requeue_report();
+
+        // the three figures a charging decision turns on
+        assert!(dump.contains("Reported usage (charged to the project)"));
+        assert!(dump.contains("Discarded by requeues (not charged)"));
+        assert!(dump.contains("True consumption (Slurm's view)"));
+
+        // 8100 of 6000 + 8100 seconds discarded
+        assert!(
+            dump.contains("57.4%"),
+            "expected the discarded share: {}",
+            dump
+        );
+
+        // the breakdown that separates the site's fault from the project's
+        let by_state = dump
+            .lines()
+            .skip_while(|line| !line.starts_with("Work was interrupted by, and absorbed"))
+            .take(3)
+            .collect::<Vec<&str>>()
+            .join("\n");
+
+        assert!(by_state.contains("NODE_FAIL"), "{}", by_state);
+        assert!(by_state.contains("PREEMPTED"), "{}", by_state);
+
+        // worst first, so NODE_FAIL's 7200 seconds outrank PREEMPTED's 900
+        let node_fail = dump.find("NODE_FAIL");
+        let preempted = dump.find("PREEMPTED");
+        assert!(
+            node_fail < preempted,
+            "worst state should come first: {}",
+            dump
+        );
+
+        // per day, and only the days that had any
+        assert!(dump.contains("2026-03-01"), "{}", dump);
+        assert!(
+            !dump.contains("2026-03-02"),
+            "quiet days are not listed: {}",
+            dump
+        );
+
+        // per user, with the events attributed to each
+        assert!(dump.contains("alice"), "{}", dump);
+        assert!(dump.contains("bob"), "{}", dump);
+    }
+
+    #[test]
+    fn test_the_requeue_report_is_a_single_line_when_there_is_nothing_to_say() {
+        // The overwhelmingly common case, and it should not print a page of
+        // zeroes to say so.
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        let mut day = DailyProjectUsageReport::default();
+        day.add_usage("alice", Usage::new(3600));
+        day.add_jobs("alice", 1);
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &day);
+
+        assert!(!report.has_requeues());
+        assert!(report
+            .requeue_report()
+            .contains("No requeued jobs recorded"));
+        assert!(!report.requeue_report().contains("By day"));
+    }
+
+    #[test]
+    fn test_a_day_whose_whole_consumption_was_requeued_is_still_shown() {
+        // A day can consist entirely of attempts that were later requeued - the
+        // usage is real and the day has plenty to say, but it has no *reported*
+        // usage, and the daily listing used to drop anything with a zero total.
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+
+        let mut day = DailyProjectUsageReport::default();
+        day.add_requeue_usage("alice", Usage::new(7200));
+        day.add_requeue_state_usage("NODE_FAIL", Usage::new(7200));
+        day.add_requeue_events("alice", "NODE_FAIL", 1);
+        report.set_report(&Date::parse("2026-03-01").unwrap(), &day);
+
+        assert_eq!(report.total_usage(), Usage::default());
+        assert_eq!(report.total_requeue_usage(), Usage::new(7200));
+
+        // it survives the daily listing, the printout and the requeue report
+        assert_eq!(report.daily_reports(true).len(), 1);
+        assert!(report.to_string().contains("2026-03-01"));
+        assert!(report.requeue_report().contains("2026-03-01"));
+    }
+
+    #[test]
+    fn test_the_daily_printout_reports_requeues_per_day() {
+        // The per-day requeue line existed on a daily report's own `Display`,
+        // but a project report renders its days itself, so it never appeared
+        // where anyone was reading it.
+        let printed = project_report_with_requeues().to_string();
+
+        let day_line = printed
+            .lines()
+            .skip_while(|line| !line.starts_with("2026-03-01"))
+            .take_while(|line| !line.starts_with("----"))
+            .find(|line| line.starts_with("Requeued:"));
+
+        let Some(day_line) = day_line else {
+            unreachable!("no per-day requeue line in:\n{}", printed);
+        };
+
+        assert!(day_line.contains("3 events"), "{}", day_line);
+
+        // and the quiet day says nothing about requeues
+        let quiet: Vec<&str> = printed
+            .lines()
+            .skip_while(|line| !line.starts_with("2026-03-02"))
+            .take_while(|line| !line.starts_with("----"))
+            .collect();
+
+        assert!(!quiet.iter().any(|line| line.starts_with("Requeued:")));
+    }
+
+    #[test]
+    fn test_requeue_usage_is_reported_separately_from_the_usage_we_always_reported() {
+        // The contract: `total_usage` is unchanged by requeue accounting, the
+        // requeue figure is carried alongside it, and the sum is a project's
+        // true consumption. Which of the two to charge for is a policy
+        // decision, so both have to survive to the client.
+        let report = report_with_requeues();
+
+        assert_eq!(report.total_usage(), Usage::new(2400));
+        assert_eq!(report.total_requeue_usage(), Usage::new(8100));
+        assert_eq!(report.total_usage_including_requeues(), Usage::new(10500));
+
+        // events are counted, not jobs: alice was requeued twice
+        assert_eq!(report.num_jobs(), 2);
+        assert_eq!(report.num_requeue_events(), 3);
+        assert_eq!(report.requeue_events_for_user("alice"), 2);
+
+        // and the three wait figures a client can now derive
+        assert_eq!(report.average_wait_seconds(), 45);
+        assert_eq!(report.average_requeue_wait_seconds(), 140);
+        assert_eq!(report.average_wait_seconds_including_requeues(), 255);
+    }
+
+    #[test]
+    fn test_requeue_events_are_bucketed_by_terminal_state() {
+        // A node failure is the site's problem and a preemption is site policy
+        // the project opted into - different arguments about who pays, which the
+        // flat requeue total cannot distinguish.
+        let report = report_with_requeues();
+
+        assert_eq!(
+            report.requeue_states(),
+            vec![("NODE_FAIL".to_string(), 2), ("PREEMPTED".to_string(), 1)]
+        );
+        assert_eq!(report.requeue_usage_in_state("NODE_FAIL"), Usage::new(7200));
+        assert_eq!(report.requeue_usage_in_state("PREEMPTED"), Usage::new(900));
+
+        // the per-state maps must account for every event and every second
+        assert_eq!(
+            report
+                .requeue_states()
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            report.num_requeue_events()
+        );
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_scaling_keeps_base_and_requeue_usage_in_the_same_units() {
+        // A client converts to credits and then subtracts one figure from the
+        // other. If a scale factor reached only one of them the subtraction
+        // would be between two different units - which is why the requeue
+        // figures are first-class fields rather than another entry in the
+        // `components` map, whose units deliberately differ from the total's.
+        let report = report_with_requeues();
+
+        let doubled = report.clone() * 2.0;
+        assert_eq!(doubled.total_usage(), Usage::new(4800));
+        assert_eq!(doubled.total_requeue_usage(), Usage::new(16200));
+        assert_eq!(
+            doubled.requeue_usage_in_state("NODE_FAIL"),
+            Usage::new(14400)
+        );
+
+        let halved = report.clone() / 2.0;
+        assert_eq!(halved.total_usage(), Usage::new(1200));
+        assert_eq!(halved.total_requeue_usage(), Usage::new(4050));
+
+        // `*=` scales the components alongside the totals, as `*` does, and the
+        // base and requeue totals move together
+        let mut in_place = report.clone();
+        in_place *= 3.0;
+        assert_eq!(in_place.total_usage(), Usage::new(7200));
+        assert_eq!(in_place.total_requeue_usage(), Usage::new(24300));
+
+        // and `scale_total` at the project level, which is what the Python
+        // bindings expose for a credit conversion
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut project_report = ProjectUsageReport::new(&project);
+        project_report.set_report(&Date::parse("2026-03-01").unwrap(), &report);
+        project_report.scale_total(0.5);
+
+        assert_eq!(project_report.total_usage(), Usage::new(1200));
+        assert_eq!(project_report.total_requeue_usage(), Usage::new(4050));
+    }
+
+    #[test]
+    fn test_scaling_a_project_report_moves_every_figure_it_holds() {
+        // The project-level operators reached into a day's `reports` and
+        // `components` and nothing else, so `project * 2.0` doubled the usage
+        // while leaving the requeue and reservation figures where they were -
+        // and `total_usage_including_requeues` then added two different units
+        // together. They delegate to the day's own operators now.
+        let project = ProjectIdentifier::parse("proj.portal").unwrap();
+        let mut report = ProjectUsageReport::new(&project);
+        report.set_report(
+            &Date::parse("2026-03-01").unwrap(),
+            &report_with_reservations(),
+        );
+
+        let base = report.total_usage();
+        let requeued = report.total_requeue_usage();
+        let reserved = report.reservation_usage("bench");
+        let reserved_requeue = report.reservation_requeue_usage("bench");
+
+        assert!(!requeued.is_zero() && !reserved.is_zero() && !reserved_requeue.is_zero());
+
+        let doubled = report.clone() * 2.0;
+
+        assert_eq!(doubled.total_usage(), base * 2.0);
+        assert_eq!(doubled.total_requeue_usage(), requeued * 2.0);
+        assert_eq!(doubled.reservation_usage("bench"), reserved * 2.0);
+        assert_eq!(
+            doubled.reservation_requeue_usage("bench"),
+            reserved_requeue * 2.0
+        );
+
+        // `*` and `*=` must agree, and so must `/` and `/=`
+        let mut in_place = report.clone();
+        in_place *= 2.0;
+        assert_eq!(in_place.total_usage(), doubled.total_usage());
+        assert_eq!(
+            in_place.total_requeue_usage(),
+            doubled.total_requeue_usage()
+        );
+
+        let halved = report.clone() / 2.0;
+        let mut halved_in_place = report.clone();
+        halved_in_place /= 2.0;
+        assert_eq!(halved.total_usage(), halved_in_place.total_usage());
+        assert_eq!(
+            halved.total_requeue_usage(),
+            halved_in_place.total_requeue_usage()
+        );
+
+        // and the day it holds is still internally consistent afterwards
+        for scaled in [doubled, halved] {
+            for day in scaled.daily_reports(false) {
+                assert!(day.is_consistent());
+            }
+        }
+    }
+
+    #[test]
+    fn test_merging_reports_adds_the_requeue_figures_too() {
+        let mut merged = report_with_requeues();
+        merged += report_with_requeues();
+
+        assert_eq!(merged.total_usage(), Usage::new(4800));
+        assert_eq!(merged.total_requeue_usage(), Usage::new(16200));
+        assert_eq!(merged.num_requeue_events(), 6);
+        assert_eq!(merged.requeue_wait_seconds(), 840);
+        assert_eq!(merged.requeue_events_in_state("NODE_FAIL"), 4);
+        assert!(merged.is_consistent());
+
+        let summed = report_with_requeues() + report_with_requeues();
+        assert_eq!(summed.total_requeue_usage(), merged.total_requeue_usage());
+        assert_eq!(summed.num_requeue_events(), merged.num_requeue_events());
+        assert!(summed.is_consistent());
+    }
+
+    #[test]
+    fn test_a_report_from_an_instance_without_requeue_accounting_still_loads() {
+        // Every requeue field is `serde(default)`, so a report from a peer that
+        // predates them deserialises as "no requeues seen" rather than failing.
+        // Nothing on the wire had to change to deploy this.
+        let legacy = serde_json::json!({
+            "reports": { "alice": { "seconds": 1800 } },
+            "num_jobs": 1,
+            "total_wait_seconds": 60,
+            "is_complete": true
+        });
+
+        let report: DailyProjectUsageReport = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(report.total_usage(), Usage::new(1800));
+        assert_eq!(report.num_jobs(), 1);
+        assert_eq!(report.total_requeue_usage(), Usage::default());
+        assert_eq!(report.num_requeue_events(), 0);
+        assert!(report.requeue_states().is_empty());
+        assert!(report.is_consistent());
+
+        // and a round trip of a report that does carry them keeps them
+        let round_tripped: DailyProjectUsageReport =
+            serde_json::from_str(&serde_json::to_string(&report_with_requeues()).unwrap()).unwrap();
+        assert_eq!(round_tripped.total_requeue_usage(), Usage::new(8100));
+        assert_eq!(round_tripped.num_requeue_events(), 3);
+    }
+
+    #[test]
+    fn test_a_component_report_carries_the_requeue_usage_for_that_component() {
+        // Asking for "cpu" gives both what the final attempts spent on CPU and
+        // what the superseded ones did - the requeued GPU-seconds of a
+        // preemption-heavy project being the more interesting figure in
+        // practice.
+        let report = report_with_requeues();
+        let cpu = report.get_component("cpu");
+
+        assert_eq!(cpu.total_usage(), Usage::new(3600));
+        assert_eq!(cpu.total_requeue_usage(), Usage::new(14400));
+        assert_eq!(cpu.num_requeue_events(), 3);
+        assert_eq!(report.requeue_components(), vec!["cpu".to_string()]);
+        assert!(cpu.is_consistent());
+
+        // the per-state breakdown describes the whole report, so it is not
+        // carried onto a single component - there is no way to apportion it
+        assert!(cpu.requeue_states().is_empty());
+    }
+
+    #[test]
+    fn test_a_component_report_keeps_the_per_job_statistics() {
+        // How long a job queued, how long it ran and how big it was are
+        // properties of the job, not of the component the usage is being sliced
+        // by - so asking for "cpu" must not lose them. It did: the component
+        // report carried the job count but not the runtime, so a caller got a
+        // non-zero `num_jobs` beside an expansion factor of 0.0, which on this
+        // scale is the sentinel for "no jobs at all".
+        let mut report = DailyProjectUsageReport::default();
+
+        report.add_usage("alice", Usage::new(1800));
+        report.add_component_usage("cpu", "alice", Usage::new(3600));
+        report.add_jobs("alice", 1);
+        report.add_wait_seconds("alice", 1800);
+        report.add_expansion("alice", 1800, 1800);
+        report.add_job_size("alice", 64, 2);
+
+        let cpu = report.get_component("cpu");
+
+        assert_eq!(cpu.num_jobs(), report.num_jobs());
+        assert_eq!(cpu.total_runtime_seconds(), 1800);
+        assert_eq!(cpu.average_runtime_seconds(), 1800);
+        assert_eq!(cpu.average_expansion_factor(), 2.0);
+        assert_eq!(cpu.aggregate_expansion_factor(), 2.0);
+        assert_eq!(cpu.expansion_factor_for_user("alice"), 2.0);
+        assert_eq!(cpu.average_cpus_per_job(), 64.0);
+        assert_eq!(cpu.average_gpus_per_job(), 2.0);
+        assert_eq!(cpu.average_cpus_per_job_for_user("alice"), 64.0);
+        assert!(cpu.is_consistent());
+
+        // and the component's own usage is still the component's, not the
+        // whole report's
+        assert_eq!(cpu.total_usage(), Usage::new(3600));
+    }
+
+    /// A day with both kinds of requeue: `alice` lost work to a node failure
+    /// the site absorbed, and asked for a requeue of her own that was charged.
+    /// The charged usage is *inside* `add_usage`, exactly as `record_job`
+    /// accumulates it.
+    fn report_with_charged_requeues() -> DailyProjectUsageReport {
+        let mut report = report_with_requeues();
+
+        report.add_usage("alice", Usage::new(3000));
+        report.add_component_usage("cpu", "alice", Usage::new(6000));
+
+        report.add_charged_requeue_usage("alice", Usage::new(3000));
+        report.add_charged_requeue_state_usage("REQUEUED", Usage::new(3000));
+        report.add_charged_requeue_component_usage("cpu", "alice", Usage::new(6000));
+        report.add_charged_requeue_events("alice", "REQUEUED", 1);
+        report.add_charged_requeue_wait_seconds("alice", 90);
+
+        report
+    }
+
+    #[test]
+    fn test_charged_requeues_are_a_subset_of_the_usage_not_an_addition_to_it() {
+        let report = report_with_charged_requeues();
+
+        // alice consumed 1800 of her own plus 3000 charged back to her
+        assert_eq!(report.usage("alice"), Usage::new(4800));
+        assert_eq!(report.charged_requeue_usage("alice"), Usage::new(3000));
+        assert_eq!(report.total_charged_requeue_usage(), Usage::new(3000));
+
+        // the true total counts the charged usage once, through `total_usage`
+        assert_eq!(
+            report.total_usage_including_requeues(),
+            report.total_usage() + report.total_requeue_usage()
+        );
+
+        // and everything requeueing cost is both kinds together
+        assert_eq!(
+            report.total_requeue_usage_including_charged(),
+            Usage::new(3000 + 7200 + 900)
+        );
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_a_report_charging_more_than_it_consumed_is_inconsistent() {
+        // The bound that says the charged maps describe a subset: charging more
+        // than the user consumed means the same usage was recorded twice.
+        let mut report = DailyProjectUsageReport::default();
+        report.add_usage("alice", Usage::new(600));
+        report.add_charged_requeue_usage("alice", Usage::new(6000));
+
+        assert!(!report.is_consistent());
+
+        // a per-user surplus must not hide under another user's deficit
+        let mut report = DailyProjectUsageReport::default();
+        report.add_usage("alice", Usage::new(600));
+        report.add_usage("bob", Usage::new(6000));
+        report.add_charged_requeue_usage("alice", Usage::new(6000));
+
+        assert!(!report.is_consistent());
+
+        // and the per-state map has to account for what was charged
+        let mut report = report_with_charged_requeues();
+        report.add_charged_requeue_state_usage("REQUEUED", Usage::new(60));
+
+        assert!(!report.is_consistent());
+    }
+
+    #[test]
+    fn test_charged_requeue_figures_survive_merging_and_scaling() {
+        let mut merged = report_with_charged_requeues();
+        merged += report_with_charged_requeues();
+
+        assert_eq!(merged.total_charged_requeue_usage(), Usage::new(6000));
+        assert_eq!(merged.num_charged_requeue_events(), 2);
+        assert_eq!(merged.charged_requeue_wait_seconds(), 180);
+        assert_eq!(
+            merged.charged_requeue_usage_in_state("REQUEUED"),
+            Usage::new(6000)
+        );
+        assert!(merged.is_consistent());
+
+        // the same through the consuming merge, which is a separate code path
+        let added = report_with_charged_requeues() + report_with_charged_requeues();
+        assert_eq!(added.total_charged_requeue_usage(), Usage::new(6000));
+        assert_eq!(added.num_charged_requeue_events(), 2);
+        assert!(added.is_consistent());
+
+        // Scaled with the usage it is a subset of, never apart from it - a
+        // charged share that stayed in seconds while the total went to credits
+        // would be a subset of nothing.
+        let halved = report_with_charged_requeues() / 2.0;
+        assert_eq!(halved.total_charged_requeue_usage(), Usage::new(1500));
+        assert_eq!(halved.usage("alice"), Usage::new(2400));
+        assert!(halved.is_consistent());
+
+        // and the event count is not usage, so scaling leaves it alone
+        assert_eq!(halved.num_charged_requeue_events(), 1);
+    }
+
+    #[test]
+    fn test_renaming_local_users_moves_their_charged_figures_too() {
+        let mut report = report_with_charged_requeues();
+        let mut renames = HashMap::new();
+        renames.insert("alice".to_string(), "alice2".to_string());
+        report.remap_local_users(&renames);
+
+        assert_eq!(report.charged_requeue_usage("alice2"), Usage::new(3000));
+        assert_eq!(report.charged_requeue_usage("alice"), Usage::default());
+        assert_eq!(report.charged_requeue_events_for_user("alice2"), 1);
+        assert_eq!(report.charged_requeue_wait_seconds_for_user("alice2"), 90);
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_a_legacy_report_with_no_charged_figures_is_consistent() {
+        // Every charged field is `serde(default)`, so a report from an instance
+        // that predates the charging policy arrives with them empty - which
+        // reads correctly as "nothing was charged", because nothing was.
+        let report = report_with_requeues();
+
+        assert!(!report.has_charged_requeues());
+        assert_eq!(report.charged_requeue_share_per_mille(), Some(0));
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_renaming_local_users_moves_their_requeue_figures_with_them() {
+        let mut report = report_with_requeues();
+        let mut renames = HashMap::new();
+        renames.insert("alice".to_string(), "alice2".to_string());
+        report.remap_local_users(&renames);
+
+        assert_eq!(report.requeue_usage("alice2"), Usage::new(7200));
+        assert_eq!(report.requeue_usage("alice"), Usage::default());
+        assert_eq!(report.requeue_events_for_user("alice2"), 2);
+        assert_eq!(report.requeue_wait_seconds_for_user("alice2"), 300);
+        assert_eq!(
+            report.requeue_component_usage("cpu", "alice2"),
+            Usage::new(14400)
+        );
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_renaming_two_locals_onto_one_adds_them_rather_than_dropping_one() {
+        // Consolidating two local accounts into one is a rename whose map is
+        // not injective. Every map was rebuilt with `collect`, which keeps
+        // whichever colliding entry the iterator yielded last - so one of the
+        // two users' jobs, usage and waits simply vanished, and which one
+        // depended on `HashMap` iteration order.
+        let mut report = DailyProjectUsageReport::default();
+
+        for user in ["alice", "alice_old"] {
+            report.add_usage(user, Usage::new(600));
+            report.add_component_usage("cpu", user, Usage::new(1200));
+            report.add_jobs(user, 2);
+            report.add_wait_seconds(user, 300);
+            report.add_expansion(user, 300, 600);
+            report.add_job_size(user, 32, 1);
+            report.add_requeue_usage(user, Usage::new(60));
+            report.add_requeue_events(user, "NODE_FAIL", 1);
+            report.add_requeue_wait_seconds(user, 30);
+            report.add_reservation_usage("bench", user, Usage::new(120));
+            report.add_reservation_requeue_usage("bench", user, Usage::new(60));
+        }
+
+        let before_usage = report.total_usage();
+        let before_jobs = report.num_jobs();
+
+        let mut renames = HashMap::new();
+        renames.insert("alice_old".to_string(), "alice".to_string());
+        report.remap_local_users(&renames);
+
+        assert_eq!(report.job_users(), vec!["alice".to_string()]);
+        assert_eq!(report.usage("alice"), before_usage);
+        assert_eq!(report.num_jobs_for_user("alice"), before_jobs);
+        assert_eq!(report.wait_seconds_for_user("alice"), 600);
+        assert_eq!(report.runtime_seconds_for_user("alice"), 1200);
+        assert_eq!(report.allocated_cpus_for_user("alice"), 64);
+        assert_eq!(report.allocated_gpus_for_user("alice"), 2);
+        assert_eq!(report.requeue_usage("alice"), Usage::new(120));
+        assert_eq!(report.requeue_events_for_user("alice"), 2);
+        assert_eq!(report.requeue_wait_seconds_for_user("alice"), 60);
+        assert_eq!(
+            report.reservation_usage_for_user("bench", "alice"),
+            Usage::new(240)
+        );
+        assert_eq!(
+            report.reservation_requeue_usage_for_user("bench", "alice"),
+            Usage::new(120)
+        );
+
+        // nothing left behind under the old name, and the scalars still agree
+        // with the maps they were merged into
+        assert_eq!(report.usage("alice_old"), Usage::default());
+        assert_eq!(report.num_jobs_for_user("alice_old"), 0);
+        assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn test_the_job_counters_saturate_rather_than_wrapping() {
+        // The scalar totals have always saturated, and said so - but every
+        // per-user counter beside them used a bare `+=`, so the map would abort
+        // long before the scalar it is supposed to agree with ever clamped.
+        // These values arrive in a peer's report, and release builds set
+        // `overflow-checks = true` with `panic = "abort"`.
+        let mut report = DailyProjectUsageReport::default();
+
+        report.add_jobs("alice", u64::MAX);
+        report.add_jobs("alice", 10);
+        report.add_wait_seconds("alice", u64::MAX);
+        report.add_wait_seconds("alice", 10);
+        report.add_expansion("alice", u64::MAX, u64::MAX);
+        report.add_expansion("alice", u64::MAX, u64::MAX);
+        report.add_job_size("alice", u64::MAX, u64::MAX);
+        report.add_job_size("alice", 10, 10);
+        report.add_requeue_events("alice", "NODE_FAIL", u64::MAX);
+        report.add_requeue_events("alice", "NODE_FAIL", 10);
+        report.add_requeue_wait_seconds("alice", u64::MAX);
+        report.add_requeue_wait_seconds("alice", 10);
+        report.add_reservation_jobs("maintenance", u64::MAX);
+        report.add_reservation_jobs("maintenance", 10);
+
+        assert_eq!(report.num_jobs_for_user("alice"), u64::MAX);
+        assert_eq!(report.wait_seconds_for_user("alice"), u64::MAX);
+        assert_eq!(report.allocated_cpus_for_user("alice"), u64::MAX);
+        assert_eq!(report.allocated_gpus_for_user("alice"), u64::MAX);
+        assert_eq!(report.requeue_events_for_user("alice"), u64::MAX);
+        assert_eq!(report.requeue_wait_seconds_for_user("alice"), u64::MAX);
+        assert_eq!(report.reservation_jobs("maintenance"), u64::MAX);
+
+        // and the same on the merge path, where two saturated reports meet
+        let merged = report.clone() + report.clone();
+        assert_eq!(merged.num_jobs_for_user("alice"), u64::MAX);
+        assert_eq!(merged.num_jobs(), u64::MAX);
+
+        let mut assigned = report.clone();
+        assigned += report;
+        assert_eq!(assigned.requeue_events_for_user("alice"), u64::MAX);
+
+        // and the consistency check reports on a saturated report rather than
+        // dying while summing it
+        let _ = assigned.is_consistent();
+    }
 
     #[test]
     fn test_usage_arithmetic_saturates_rather_than_wrapping() {

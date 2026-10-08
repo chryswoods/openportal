@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: © 2024 Christopher Woods <Christopher.Woods@bristol.ac.uk>
 // SPDX-License-Identifier: MIT
 
+// Every dependency of this crate is now declared for the library, which the two
+// binaries share; a binary uses only the handful it needs directly. The lint is
+// still doing its job on `src/lib.rs`, which is where an unused dependency would
+// actually be dead weight.
+#![allow(unused_crate_dependencies)]
+
 use anyhow::Result;
 
 use greatwestern::grammar::Instruction::{
-    AddLocalProject, AddLocalUser, GetLocalLimit, GetLocalUsageReport, RemoveLocalProject,
+    AddLocalProject, AddLocalUser, GetLocalLimit, GetLocalUsageReport, IsLocalProjectAdded,
+    IsLocalProjectRemoved, IsLocalUserAdded, IsLocalUserRemoved, RemoveLocalProject,
     RemoveLocalUser, SetLocalLimit,
 };
 use greatwestern::Hpc;
@@ -18,9 +25,9 @@ use templemeads::Error;
 type Envelope = templemeads::job::Envelope<Hpc>;
 type Job = templemeads::job::Job<Hpc>;
 
-mod cache;
-mod sacctmgr;
-mod slurm;
+use op_slurm::cache;
+use op_slurm::sacctmgr;
+use op_slurm::slurm;
 
 ///
 /// Main function for the slurm scheduler application
@@ -107,6 +114,31 @@ async fn main() -> Result<()> {
     let parent_account = config.option("parent-account", "root");
     cache::set_parent_account(&parent_account).await?;
 
+    // Which requeued attempts are charged to a project. The default charges the
+    // requeues a user asked for and absorbs the ones the site caused, which is
+    // a change from the behaviour before this option existed - chosen over a
+    // default that every site would have to remember to set, since the cost of
+    // forgetting that one is silently under-billing for ever. Logged either
+    // way, so an upgrade that changes a site's behaviour says so.
+    let requeue_policy: slurm::RequeuePolicy = config
+        .option("requeue-policy", "charge_requeue_state_only")
+        .parse()?;
+
+    cache::set_requeue_policy(requeue_policy).await;
+
+    match requeue_policy.charged_states() {
+        [] => tracing::info!(
+            "Requeue policy '{}': no requeued attempt is charged to a project.",
+            requeue_policy
+        ),
+        states => tracing::info!(
+            "Requeue policy '{}': a requeued attempt is charged to the project when it \
+             ended in {}. Every other requeue is absorbed.",
+            requeue_policy,
+            states.join(" or ")
+        ),
+    }
+
     let slurm_server = config.option("slurm-server", "");
 
     // get the sacct, sacctmgr, scontrol and scancel commands - we may need these even if
@@ -125,6 +157,11 @@ async fn main() -> Result<()> {
         max_slurm_runners,
     )
     .await;
+
+    // Reports compute the requeue correction; this writes it into Slurm, off
+    // the reporting path and on its own schedule. See
+    // `docs/plans/slurm-requeue-charging-design.md`.
+    sacctmgr::spawn_limit_applier();
 
     set_notify_runner::<Hpc>(default_notify_runner).await?;
 
@@ -169,6 +206,18 @@ async fn main() -> Result<()> {
                         sacctmgr::cancel_pending_user_jobs(mapping.local_user().unix()?, job.expires()).await?;
                         tracing::info!("Cancelled pending jobs for user {}", mapping);
                         job.completed_none()
+                    },
+                    IsLocalProjectAdded(mapping) => {
+                        job.completed(sacctmgr::is_local_project_added(&mapping, job.expires()).await?)
+                    },
+                    IsLocalProjectRemoved(mapping) => {
+                        job.completed(sacctmgr::is_local_project_removed(&mapping, job.expires()).await?)
+                    },
+                    IsLocalUserAdded(mapping) => {
+                        job.completed(sacctmgr::is_local_user_added(&mapping, job.expires()).await?)
+                    },
+                    IsLocalUserRemoved(mapping) => {
+                        job.completed(sacctmgr::is_local_user_removed(&mapping, job.expires()).await?)
                     },
                     GetLocalUsageReport(mapping, dates) => {
                         let report = sacctmgr::get_usage_report(&mapping, &dates, job.expires()).await?;
@@ -237,6 +286,37 @@ async fn main() -> Result<()> {
 
         tracing::info!("Connected to slurm server at {}", slurm_server);
 
+        // The cluster is needed on this path too, and for more than reading:
+        // the account and association payloads sent over REST name it, and
+        // `is_local_project_added` checks against it. Left unresolved,
+        // `cache::get_cluster` falls back to the literal "linux", so accounts
+        // would be created against a cluster that probably does not exist while
+        // every check compared against that same wrong value and passed.
+        //
+        // A warning rather than an error, unlike the command-line path above.
+        // There, `sacctmgr` is how the agent does everything, so being unable
+        // to run it is fatal by definition. Here it is only needed for this and
+        // for usage reporting, and a site that has slurmrestd but not a local
+        // `sacctmgr` should not be stopped from starting - it should be told
+        // loudly what will not work.
+        if let Err(e) = sacctmgr::find_cluster().await {
+            match slurm_cluster.is_empty() {
+                true => tracing::warn!(
+                    "Could not ask Slurm which cluster to use ({}), and no slurm-cluster \
+                     option is set. Accounts and associations will be created against the \
+                     default cluster name, and usage reports will be empty. Set \
+                     slurm-cluster to the name of your cluster.",
+                    e
+                ),
+                false => tracing::warn!(
+                    "Could not confirm that cluster '{}' exists ({}). Continuing with it, \
+                     since it was configured explicitly.",
+                    slurm_cluster,
+                    e
+                ),
+            }
+        }
+
         async_runnable! {
             ///
             /// Runnable function that will be called when a job is received
@@ -273,6 +353,18 @@ async fn main() -> Result<()> {
                         sacctmgr::cancel_pending_user_jobs(mapping.local_user().unix()?, job.expires()).await?;
                         tracing::info!("Cancelled pending jobs for user {}", mapping);
                         job.completed_none()
+                    },
+                    IsLocalProjectAdded(mapping) => {
+                        job.completed(slurm::is_local_project_added(&mapping, job.expires()).await?)
+                    },
+                    IsLocalProjectRemoved(mapping) => {
+                        job.completed(slurm::is_local_project_removed(&mapping, job.expires()).await?)
+                    },
+                    IsLocalUserAdded(mapping) => {
+                        job.completed(slurm::is_local_user_added(&mapping, job.expires()).await?)
+                    },
+                    IsLocalUserRemoved(mapping) => {
+                        job.completed(slurm::is_local_user_removed(&mapping, job.expires()).await?)
                     },
                     GetLocalUsageReport(mapping, dates) => {
                         // use sacctmgr for now, as we need to validate the API response

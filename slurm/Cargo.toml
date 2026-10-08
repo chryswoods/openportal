@@ -3,12 +3,27 @@
 
 [package]
 name = "op-slurm"
-version = "0.91.0"
+version = "0.94.0"
 description = "Agent that interfaces OpenPortal with the slurm scheduler"
 edition = "2021"
 license = "MIT"
 homepage = "https://github.com/chryswoods/openportal/"
 repository = "https://github.com/chryswoods/openportal/"
+
+[[bin]]
+name = "op-slurm"
+path = "src/main.rs"
+
+# An operator tool, not part of the agent. It shares the agent's library so that
+# what it reports about a job and what the agent reports cannot drift apart.
+[[bin]]
+name = "get_reservation_report"
+path = "tools/get_reservation_report.rs"
+
+# Likewise: what requeueing cost a project, or the whole cluster.
+[[bin]]
+name = "get_requeue_report"
+path = "tools/get_requeue_report.rs"
 
 [dependencies]
 anyhow = { version="1.0.100", features = ["backtrace"] }

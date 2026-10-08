@@ -1469,6 +1469,13 @@ impl Job {
         self.is_finished()
     }
 
+    fn completed_none(&self) -> PyResult<Job> {
+        match self.0.completed_none() {
+            Ok(result) => Ok(result.into()),
+            Err(e) => Err(PyErr::new::<PyOSError, _>(format!("{:?}", e))),
+        }
+    }
+
     fn completed(&self, py: Python<'_>, result: Py<PyAny>) -> PyResult<Job> {
         macro_rules! try_extract {
             ($type:ty, $transform:expr) => {
@@ -1519,6 +1526,15 @@ impl Job {
         try_extract!(Vec<UserMapping>, |v: Vec<UserMapping>| {
             v.into_iter().map(|item| item.0.clone()).collect::<Vec<_>>()
         });
+        // `get_awards` answers a list of these, and without this arm it could
+        // not answer at all: no other `Vec<T>` extraction matches a list of
+        // `AwardDetails`, so a non-empty answer fell through to "Could not
+        // extract result type". Named `Vec<ProjectDetails>` on the wire, via
+        // `NamedType for AwardDetails` - see the matching arm in `result`,
+        // which is the half that makes it readable.
+        try_extract!(Vec<AwardDetails>, |v: Vec<AwardDetails>| {
+            v.into_iter().map(|item| item.0.clone()).collect::<Vec<_>>()
+        });
         try_extract!(Vec<String>, |v| v);
         try_extract!(Vec<Usage>, |v: Vec<Usage>| {
             v.into_iter().map(|item| item.0).collect::<Vec<_>>()
@@ -1556,7 +1572,16 @@ impl Job {
                 }
             }
 
-            if is_volume_quota_dict && !map.is_empty() {
+            // Deliberately no `!map.is_empty()` here. An empty dict is a
+            // legitimate answer - "this project has no quotas set" - and
+            // refusing it made that unsayable: `completed({})` failed with
+            // "Could not extract result type", which is a hard failure rather
+            // than a mislabel. Nor is it ambiguous the way an empty list is:
+            // this is the only dict type in the table, so `{}` has exactly one
+            // reading. An empty *list* is ambiguous between every `Vec<T>` and
+            // gets whichever arm is tried first, but that is harmless - the
+            // reader turns `[]` into an empty list under any of those names.
+            if is_volume_quota_dict {
                 return match self.0.completed(map) {
                     Ok(result) => Ok(result.into()),
                     Err(e) => Err(PyErr::new::<PyOSError, _>(format!("{:?}", e))),
@@ -1619,6 +1644,37 @@ impl Job {
             .error_or_infer()
             .map(|e| e.kind().to_owned())
             .unwrap_or_default())
+    }
+
+    /// The name of the type this job's result is, or `"None"` if it has none.
+    ///
+    /// The counterpart to [`result`]: that gives the value, this gives the name
+    /// it travelled under. Most Python never needs it - `result` has already
+    /// used it to decide what to build - but it is the only way to see what a
+    /// job was *answered as*, which matters in two places.
+    ///
+    /// Answering an instruction with the wrong type is not a failure either
+    /// side detects: a well-formed value under the wrong name deserialises
+    /// into the wrong thing or not at all, and nothing on the wire objects. A
+    /// portal's own tests are where that gets caught, and they need to be able
+    /// to look.
+    ///
+    /// It is also how an unrecognised type is diagnosed. `result` raises
+    /// `Unknown result type: X` for a name this module cannot build, and X is
+    /// the useful half of that - a peer answering with a type newer than this
+    /// module is a version mismatch rather than a fault, and this says so.
+    ///
+    /// Note the names are the *Rust* type names, so they are not always the
+    /// Python class: an `AwardDetails` is `"ProjectDetails"`, and a list is
+    /// `"Vec<T>"` of the element's name. Unlike a `Job` on either the Rust or
+    /// the Java side, an unfinished job answers `"None"` here rather than
+    /// nothing at all, matching `error_kind`'s empty string.
+    #[getter]
+    fn result_type(&self) -> PyResult<String> {
+        match self.0.result_type() {
+            Ok(result_type) => Ok(result_type),
+            Err(e) => Err(PyErr::new::<PyOSError, _>(format!("{:?}", e))),
+        }
     }
 
     /// Raise this job's error, if it has one. A no-op otherwise.
@@ -1901,6 +1957,23 @@ impl Job {
                         let list = PyList::empty(py);
                         for item in result {
                             list.append(ProjectMapping::from(item).into_pyobject(py)?)?;
+                        }
+                        Ok(list.into_any())
+                    }
+                    None => Ok(py.None().into_bound(py)),
+                }
+            }
+            "Vec<ProjectDetails>" => {
+                let result = match self.0.result::<Vec<grammar::AwardDetails>>() {
+                    Ok(result) => result,
+                    Err(e) => return Err(PyErr::new::<PyOSError, _>(format!("{:?}", e))),
+                };
+
+                match result {
+                    Some(result) => {
+                        let list = PyList::empty(py);
+                        for item in result {
+                            list.append(AwardDetails::from(item).into_pyobject(py)?)?;
                         }
                         Ok(list.into_any())
                     }
@@ -2874,6 +2947,61 @@ impl UsageReport {
         Ok(self.0.get_component(component).into())
     }
 
+    /// Usage consumed by job attempts that were superseded by a requeue. This
+    /// is not included in `total_usage`, which counts only each job's final
+    /// attempt - the figure OpenPortal has always reported.
+    #[getter]
+    fn total_requeue_usage(&self) -> PyResult<Usage> {
+        Ok(self.0.total_requeue_usage().into())
+    }
+
+    /// True consumption: `total_usage` plus `total_requeue_usage`.
+    #[getter]
+    fn total_usage_including_requeues(&self) -> PyResult<Usage> {
+        Ok(self.0.total_usage_including_requeues().into())
+    }
+
+    /// The number of requeue events - a job requeued four times counts four.
+    #[getter]
+    fn num_requeue_events(&self) -> PyResult<u64> {
+        Ok(self.0.num_requeue_events())
+    }
+
+    /// True if anything about a requeue was recorded for any project.
+    #[getter]
+    fn has_requeues(&self) -> PyResult<bool> {
+        Ok(self.0.has_requeues())
+    }
+
+    /// A readable requeue summary for every project that has requeues. Print it.
+    fn requeue_report(&self) -> PyResult<String> {
+        Ok(self.0.requeue_report())
+    }
+
+    /// True if any project's jobs ran inside a reservation.
+    #[getter]
+    fn has_reservations(&self) -> PyResult<bool> {
+        Ok(self.0.has_reservations())
+    }
+
+    /// Usage consumed inside any reservation, across every project.
+    #[getter]
+    fn total_reservation_usage(&self) -> PyResult<Usage> {
+        Ok(self.0.total_reservation_usage().into())
+    }
+
+    /// A readable expansion-factor and job-size summary for every project that
+    /// ran any jobs. Print it.
+    fn expansion_factor_report(&self) -> PyResult<String> {
+        Ok(self.0.expansion_factor_report())
+    }
+
+    /// A readable reservation summary for every project that ran inside one.
+    /// Print it.
+    fn reservation_report(&self) -> PyResult<String> {
+        Ok(self.0.reservation_report())
+    }
+
     fn remap_portal(&mut self, new_portal: &PortalIdentifier) -> PyResult<()> {
         self.0
             .remap_portal(&new_portal.0)
@@ -3079,6 +3207,253 @@ impl ProjectUsageReport {
     #[getter]
     fn average_wait_seconds(&self) -> PyResult<u64> {
         Ok(self.0.average_wait_seconds())
+    }
+
+    /// Total wall-clock runtime of the jobs in this report, in seconds. Not the
+    /// same as usage, which weights each second by the fraction of a node held.
+    #[getter]
+    fn total_runtime_seconds(&self) -> PyResult<u64> {
+        Ok(self.0.total_runtime_seconds())
+    }
+
+    /// How many jobs the runtime and expansion figures were accumulated over -
+    /// the denominator for the means derived from them. Not the same as
+    /// `num_jobs`: a job still running when the window closed is counted as a
+    /// job but has no runtime to contribute.
+    #[getter]
+    fn expansion_jobs(&self) -> PyResult<u64> {
+        Ok(self.0.expansion_jobs())
+    }
+
+    /// The mean runtime of a job, in seconds - the figure that gives a wait its
+    /// meaning. Eleven hours of queueing says one thing beside a job that runs
+    /// for a day and quite another beside one that runs for five minutes.
+    #[getter]
+    fn average_runtime_seconds(&self) -> PyResult<u64> {
+        Ok(self.0.average_runtime_seconds())
+    }
+
+    fn average_runtime_seconds_for_user(&self, user: &str) -> PyResult<u64> {
+        Ok(self.0.average_runtime_seconds_for_user(user))
+    }
+
+    /// One user's total turnaround over their total runtime - their whole share
+    /// of the report treated as one job.
+    ///
+    /// Read beside `expansion_factor_for_user`, which is a mean of ratios. The
+    /// gap between the two is the diagnostic: a mean far above this means a
+    /// handful of the user's jobs waited a long time and then exited almost
+    /// immediately, which one figure alone cannot tell apart from a user who
+    /// simply waits.
+    fn aggregate_expansion_factor_for_user(&self, user: &str) -> PyResult<f64> {
+        Ok(self.0.aggregate_expansion_factor_for_user(user))
+    }
+
+    /// Mean expansion factor per job: turnaround over runtime,
+    /// `(wait + run) / run`, the classical definition used by `sreport`.
+    ///
+    /// 1.0 is the ideal - a job that ran the instant it became eligible - and
+    /// the figure rises with every second spent queueing; 2.0 means jobs spent
+    /// as long waiting as running. 0.0 means there were no jobs, not a perfect
+    /// score: no real job can score below 1.0.
+    ///
+    /// Being a mean of ratios, one job that queued for hours and exited in
+    /// seconds moves it a long way. That is the point - it is what a user
+    /// fighting a job that will not run looks like - but read it alongside
+    /// `aggregate_expansion_factor`, which no single job can move much.
+    #[getter]
+    fn average_expansion_factor(&self) -> PyResult<f64> {
+        Ok(self.0.average_expansion_factor())
+    }
+
+    /// Total turnaround over total runtime, on the same 1.0-is-ideal scale -
+    /// the robust companion to `average_expansion_factor`. A mean far above the
+    /// aggregate says a few short jobs waited a long time.
+    #[getter]
+    fn aggregate_expansion_factor(&self) -> PyResult<f64> {
+        Ok(self.0.aggregate_expansion_factor())
+    }
+
+    /// Mean expansion factor for one local user - which is where a struggling
+    /// user shows up, the project-wide mean having averaged them away.
+    fn expansion_factor_for_user(&self, user: &str) -> PyResult<f64> {
+        Ok(self.0.expansion_factor_for_user(user))
+    }
+
+    /// Mean number of cores a job was allocated - many small jobs against a few
+    /// large ones. Each job counts once however long it ran, and this cannot be
+    /// got from usage: the same core-seconds come from one job on many cores or
+    /// many jobs on one core.
+    #[getter]
+    fn average_cpus_per_job(&self) -> PyResult<f64> {
+        Ok(self.0.average_cpus_per_job())
+    }
+
+    /// Mean number of GPUs a job was allocated. Zero for a project that ran no
+    /// GPU work, which is itself worth knowing on a GPU machine.
+    #[getter]
+    fn average_gpus_per_job(&self) -> PyResult<f64> {
+        Ok(self.0.average_gpus_per_job())
+    }
+
+    fn average_cpus_per_job_for_user(&self, user: &str) -> PyResult<f64> {
+        Ok(self.0.average_cpus_per_job_for_user(user))
+    }
+
+    fn average_gpus_per_job_for_user(&self, user: &str) -> PyResult<f64> {
+        Ok(self.0.average_gpus_per_job_for_user(user))
+    }
+
+    /// Usage consumed by job attempts that were superseded by a requeue. Not
+    /// included in `total_usage`, which counts only each job's final attempt -
+    /// the figure OpenPortal has always reported. Which of the two a project
+    /// should be charged for is a policy decision, so both are reported.
+    #[getter]
+    fn total_requeue_usage(&self) -> PyResult<Usage> {
+        Ok(self.0.total_requeue_usage().into())
+    }
+
+    /// True consumption: `total_usage` plus `total_requeue_usage`.
+    #[getter]
+    fn total_usage_including_requeues(&self) -> PyResult<Usage> {
+        Ok(self.0.total_usage_including_requeues().into())
+    }
+
+    /// The number of requeue events - a job requeued four times counts four.
+    #[getter]
+    fn num_requeue_events(&self) -> PyResult<u64> {
+        Ok(self.0.num_requeue_events())
+    }
+
+    /// Queue wait accumulated by superseded attempts, in seconds.
+    #[getter]
+    fn requeue_wait_seconds(&self) -> PyResult<u64> {
+        Ok(self.0.requeue_wait_seconds())
+    }
+
+    /// Mean wait per requeue - not per job.
+    #[getter]
+    fn average_requeue_wait_seconds(&self) -> PyResult<u64> {
+        Ok(self.0.average_requeue_wait_seconds())
+    }
+
+    /// Mean total queue wait per job, counting the waits of every attempt.
+    #[getter]
+    fn average_wait_seconds_including_requeues(&self) -> PyResult<u64> {
+        Ok(self.0.average_wait_seconds_including_requeues())
+    }
+
+    /// Requeue events by the terminal state of the superseded attempt, e.g.
+    /// `NODE_FAIL` (a site problem) against `PREEMPTED` (site policy) against
+    /// `CANCELLED`. Returned as a list of `(state, count)` pairs.
+    #[getter]
+    fn requeue_states(&self) -> PyResult<Vec<(String, u64)>> {
+        Ok(self.0.requeue_states())
+    }
+
+    /// Requeue usage attributable to superseded attempts that ended in `state`.
+    fn requeue_usage_in_state(&self, state: &str) -> PyResult<Usage> {
+        Ok(self.0.requeue_usage_in_state(state).into())
+    }
+
+    /// Requeue events and usage per interrupting state, worst first, as a list
+    /// of `(state, events, usage)` tuples.
+    #[getter]
+    fn requeue_state_summary(&self) -> PyResult<Vec<(String, u64, Usage)>> {
+        Ok(self
+            .0
+            .requeue_state_summary()
+            .into_iter()
+            .map(|(state, events, usage)| (state, events, usage.into()))
+            .collect())
+    }
+
+    /// True if anything about a requeue was recorded for any day.
+    #[getter]
+    fn has_requeues(&self) -> PyResult<bool> {
+        Ok(self.0.has_requeues())
+    }
+
+    /// A readable summary of everything this report knows about requeues:
+    /// what was reported, what was discarded, what Slurm considers the true
+    /// total, and which states did the interrupting - broken down by state, by
+    /// day and by user. Print it.
+    fn requeue_report(&self) -> PyResult<String> {
+        Ok(self.0.requeue_report())
+    }
+
+    /// True if any of this project's jobs ran inside a reservation.
+    #[getter]
+    fn has_reservations(&self) -> PyResult<bool> {
+        Ok(self.0.has_reservations())
+    }
+
+    /// The reservations this project's jobs ran under.
+    #[getter]
+    fn reservations(&self) -> PyResult<Vec<String>> {
+        Ok(self.0.reservations())
+    }
+
+    /// Usage consumed inside `reservation`, counting every attempt - a
+    /// superseded attempt held the reservation's nodes exactly as its
+    /// replacement did.
+    fn reservation_usage(&self, reservation: &str) -> PyResult<Usage> {
+        Ok(self.0.reservation_usage(reservation).into())
+    }
+
+    /// The part of `reservation_usage` that was discarded by a requeue.
+    fn reservation_requeue_usage(&self, reservation: &str) -> PyResult<Usage> {
+        Ok(self.0.reservation_requeue_usage(reservation).into())
+    }
+
+    fn reservation_jobs(&self, reservation: &str) -> PyResult<u64> {
+        Ok(self.0.reservation_jobs(reservation))
+    }
+
+    /// Usage consumed inside any reservation.
+    #[getter]
+    fn total_reservation_usage(&self) -> PyResult<Usage> {
+        Ok(self.0.total_reservation_usage().into())
+    }
+
+    /// Usage consumed outside any reservation.
+    #[getter]
+    fn usage_outside_reservations(&self) -> PyResult<Usage> {
+        Ok(self.0.usage_outside_reservations().into())
+    }
+
+    /// Jobs, usage and discarded share per reservation, busiest first, as a list
+    /// of `(reservation, jobs, usage, requeued)` tuples.
+    #[getter]
+    fn reservation_summary(&self) -> PyResult<Vec<(String, u64, Usage, Usage)>> {
+        Ok(self
+            .0
+            .reservation_summary()
+            .into_iter()
+            .map(|(name, jobs, usage, requeued)| (name, jobs, usage.into(), requeued.into()))
+            .collect())
+    }
+
+    /// A readable summary of how well this project's jobs were served and what
+    /// shape they were - expansion factor and job size, by user and by day.
+    /// Print it.
+    ///
+    /// Both are distribution questions being asked of a single number, so the
+    /// per-user table is the point of the report rather than a refinement of it:
+    /// a project-wide mean job size of twenty cores can be four 512-core jobs
+    /// beside a hundred 2-core ones, describing neither.
+    fn expansion_factor_report(&self) -> PyResult<String> {
+        Ok(self.0.expansion_factor_report())
+    }
+
+    /// A readable summary of what this project ran inside reservations, by
+    /// reservation, day and user. Print it.
+    ///
+    /// Note what it is not: a reservation's utilisation. What a reservation
+    /// *held* is a property of the reservation, not of any one project - a
+    /// reservation is usually shared - and the job records do not carry it.
+    fn reservation_report(&self) -> PyResult<String> {
+        Ok(self.0.reservation_report())
     }
 
     #[getter]
@@ -3714,6 +4089,269 @@ impl DailyProjectUsageReport {
 
     fn get_component(&self, component: &str) -> PyResult<DailyProjectUsageReport> {
         Ok(self.0.get_component(component).into())
+    }
+
+    /// Total wall-clock runtime of the jobs in this report, in seconds. Not the
+    /// same as usage, which weights each second by the fraction of a node held.
+    #[getter]
+    fn total_runtime_seconds(&self) -> PyResult<u64> {
+        Ok(self.0.total_runtime_seconds())
+    }
+
+    /// How many jobs the runtime and expansion figures were accumulated over -
+    /// the denominator for the means derived from them. Not the same as
+    /// `num_jobs`: a job still running when the window closed is counted as a
+    /// job but has no runtime to contribute.
+    #[getter]
+    fn expansion_jobs(&self) -> PyResult<u64> {
+        Ok(self.0.expansion_jobs())
+    }
+
+    /// The mean runtime of a job, in seconds - the figure that gives a wait its
+    /// meaning. Eleven hours of queueing says one thing beside a job that runs
+    /// for a day and quite another beside one that runs for five minutes.
+    #[getter]
+    fn average_runtime_seconds(&self) -> PyResult<u64> {
+        Ok(self.0.average_runtime_seconds())
+    }
+
+    fn average_runtime_seconds_for_user(&self, user: &str) -> PyResult<u64> {
+        Ok(self.0.average_runtime_seconds_for_user(user))
+    }
+
+    /// One user's total turnaround over their total runtime - their whole share
+    /// of the report treated as one job.
+    ///
+    /// Read beside `expansion_factor_for_user`, which is a mean of ratios. The
+    /// gap between the two is the diagnostic: a mean far above this means a
+    /// handful of the user's jobs waited a long time and then exited almost
+    /// immediately, which one figure alone cannot tell apart from a user who
+    /// simply waits.
+    fn aggregate_expansion_factor_for_user(&self, user: &str) -> PyResult<f64> {
+        Ok(self.0.aggregate_expansion_factor_for_user(user))
+    }
+
+    /// Mean expansion factor per job: turnaround over runtime,
+    /// `(wait + run) / run`, the classical definition used by `sreport`.
+    ///
+    /// 1.0 is the ideal - a job that ran the instant it became eligible - and
+    /// the figure rises with every second spent queueing; 2.0 means jobs spent
+    /// as long waiting as running. 0.0 means there were no jobs, not a perfect
+    /// score: no real job can score below 1.0.
+    ///
+    /// Being a mean of ratios, one job that queued for hours and exited in
+    /// seconds moves it a long way. That is the point - it is what a user
+    /// fighting a job that will not run looks like - but read it alongside
+    /// `aggregate_expansion_factor`, which no single job can move much.
+    #[getter]
+    fn average_expansion_factor(&self) -> PyResult<f64> {
+        Ok(self.0.average_expansion_factor())
+    }
+
+    /// Total turnaround over total runtime, on the same 1.0-is-ideal scale -
+    /// the robust companion to `average_expansion_factor`. A mean far above the
+    /// aggregate says a few short jobs waited a long time.
+    #[getter]
+    fn aggregate_expansion_factor(&self) -> PyResult<f64> {
+        Ok(self.0.aggregate_expansion_factor())
+    }
+
+    /// Mean expansion factor for one local user - which is where a struggling
+    /// user shows up, the project-wide mean having averaged them away.
+    fn expansion_factor_for_user(&self, user: &str) -> PyResult<f64> {
+        Ok(self.0.expansion_factor_for_user(user))
+    }
+
+    /// Mean number of cores a job was allocated - many small jobs against a few
+    /// large ones. Each job counts once however long it ran, and this cannot be
+    /// got from usage: the same core-seconds come from one job on many cores or
+    /// many jobs on one core.
+    #[getter]
+    fn average_cpus_per_job(&self) -> PyResult<f64> {
+        Ok(self.0.average_cpus_per_job())
+    }
+
+    /// Mean number of GPUs a job was allocated. Zero for a project that ran no
+    /// GPU work, which is itself worth knowing on a GPU machine.
+    #[getter]
+    fn average_gpus_per_job(&self) -> PyResult<f64> {
+        Ok(self.0.average_gpus_per_job())
+    }
+
+    fn average_cpus_per_job_for_user(&self, user: &str) -> PyResult<f64> {
+        Ok(self.0.average_cpus_per_job_for_user(user))
+    }
+
+    fn average_gpus_per_job_for_user(&self, user: &str) -> PyResult<f64> {
+        Ok(self.0.average_gpus_per_job_for_user(user))
+    }
+
+    fn runtime_seconds_for_user(&self, user: &str) -> PyResult<u64> {
+        Ok(self.0.runtime_seconds_for_user(user))
+    }
+
+    /// The cores allocated to this day's jobs, summed over jobs - the numerator
+    /// of `average_cpus_per_job`.
+    #[getter]
+    fn total_allocated_cpus(&self) -> PyResult<u64> {
+        Ok(self.0.total_allocated_cpus())
+    }
+
+    /// The GPUs allocated to this day's jobs, summed over jobs.
+    #[getter]
+    fn total_allocated_gpus(&self) -> PyResult<u64> {
+        Ok(self.0.total_allocated_gpus())
+    }
+
+    /// Usage this user consumed on attempts superseded by a requeue.
+    fn requeue_usage(&self, user: &str) -> PyResult<Usage> {
+        Ok(self.0.requeue_usage(user).into())
+    }
+
+    /// Usage consumed by job attempts that were superseded by a requeue. Not
+    /// included in `total_usage` - see `ProjectUsageReport`.
+    #[getter]
+    fn total_requeue_usage(&self) -> PyResult<Usage> {
+        Ok(self.0.total_requeue_usage().into())
+    }
+
+    /// True consumption: `total_usage` plus `total_requeue_usage`.
+    #[getter]
+    fn total_usage_including_requeues(&self) -> PyResult<Usage> {
+        Ok(self.0.total_usage_including_requeues().into())
+    }
+
+    /// The number of requeue events - a job requeued four times counts four.
+    #[getter]
+    fn num_requeue_events(&self) -> PyResult<u64> {
+        Ok(self.0.num_requeue_events())
+    }
+
+    fn requeue_events_for_user(&self, user: &str) -> PyResult<u64> {
+        Ok(self.0.requeue_events_for_user(user))
+    }
+
+    /// Queue wait accumulated by superseded attempts, in seconds.
+    #[getter]
+    fn requeue_wait_seconds(&self) -> PyResult<u64> {
+        Ok(self.0.requeue_wait_seconds())
+    }
+
+    fn requeue_wait_seconds_for_user(&self, user: &str) -> PyResult<u64> {
+        Ok(self.0.requeue_wait_seconds_for_user(user))
+    }
+
+    /// Mean wait per requeue - not per job.
+    #[getter]
+    fn average_requeue_wait_seconds(&self) -> PyResult<u64> {
+        Ok(self.0.average_requeue_wait_seconds())
+    }
+
+    /// Mean total queue wait per job, counting the waits of every attempt.
+    #[getter]
+    fn average_wait_seconds_including_requeues(&self) -> PyResult<u64> {
+        Ok(self.0.average_wait_seconds_including_requeues())
+    }
+
+    /// Requeue events by the terminal state of the superseded attempt, as a
+    /// list of `(state, count)` pairs.
+    #[getter]
+    fn requeue_states(&self) -> PyResult<Vec<(String, u64)>> {
+        Ok(self.0.requeue_states())
+    }
+
+    fn requeue_events_in_state(&self, state: &str) -> PyResult<u64> {
+        Ok(self.0.requeue_events_in_state(state))
+    }
+
+    fn requeue_usage_in_state(&self, state: &str) -> PyResult<Usage> {
+        Ok(self.0.requeue_usage_in_state(state).into())
+    }
+
+    /// Requeue events and usage per interrupting state, worst first, as a list
+    /// of `(state, events, usage)` tuples.
+    #[getter]
+    fn requeue_state_summary(&self) -> PyResult<Vec<(String, u64, Usage)>> {
+        Ok(self
+            .0
+            .requeue_state_summary()
+            .into_iter()
+            .map(|(state, events, usage)| (state, events, usage.into()))
+            .collect())
+    }
+
+    /// True if anything about a requeue was recorded for this day.
+    #[getter]
+    fn has_requeues(&self) -> PyResult<bool> {
+        Ok(self.0.has_requeues())
+    }
+
+    /// True if any of this day's jobs ran inside a reservation.
+    #[getter]
+    fn has_reservations(&self) -> PyResult<bool> {
+        Ok(self.0.has_reservations())
+    }
+
+    #[getter]
+    fn reservations(&self) -> PyResult<Vec<String>> {
+        Ok(self.0.reservations())
+    }
+
+    fn reservation_usage(&self, reservation: &str) -> PyResult<Usage> {
+        Ok(self.0.reservation_usage(reservation).into())
+    }
+
+    fn reservation_usage_for_user(&self, reservation: &str, user: &str) -> PyResult<Usage> {
+        Ok(self.0.reservation_usage_for_user(reservation, user).into())
+    }
+
+    fn reservation_requeue_usage(&self, reservation: &str) -> PyResult<Usage> {
+        Ok(self.0.reservation_requeue_usage(reservation).into())
+    }
+
+    fn reservation_jobs(&self, reservation: &str) -> PyResult<u64> {
+        Ok(self.0.reservation_jobs(reservation))
+    }
+
+    fn reservation_users(&self, reservation: &str) -> PyResult<Vec<String>> {
+        Ok(self.0.reservation_users(reservation))
+    }
+
+    #[getter]
+    fn total_reservation_usage(&self) -> PyResult<Usage> {
+        Ok(self.0.total_reservation_usage().into())
+    }
+
+    #[getter]
+    fn usage_outside_reservations(&self) -> PyResult<Usage> {
+        Ok(self.0.usage_outside_reservations().into())
+    }
+
+    /// Jobs, usage and discarded share per reservation, busiest first.
+    #[getter]
+    fn reservation_summary(&self) -> PyResult<Vec<(String, u64, Usage, Usage)>> {
+        Ok(self
+            .0
+            .reservation_summary()
+            .into_iter()
+            .map(|(name, jobs, usage, requeued)| (name, jobs, usage.into(), requeued.into()))
+            .collect())
+    }
+
+    /// The local users who lost work to a requeue on this day.
+    #[getter]
+    fn requeue_users(&self) -> PyResult<Vec<String>> {
+        Ok(self.0.requeue_users())
+    }
+
+    /// The components for which requeue usage was recorded.
+    #[getter]
+    fn requeue_components(&self) -> PyResult<Vec<String>> {
+        Ok(self.0.requeue_components())
+    }
+
+    fn total_requeue_component_usage(&self, component: &str) -> PyResult<Usage> {
+        Ok(self.0.total_requeue_component_usage(component).into())
     }
 
     #[getter]

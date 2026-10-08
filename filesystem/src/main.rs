@@ -7,13 +7,16 @@ use chrono::Utc;
 use greatwestern::grammar::Instruction::{
     AddLocalProject, AddLocalUser, ClearLocalProjectQuota, ClearLocalUserQuota, GetLocalHomeDir,
     GetLocalProjectDirs, GetLocalProjectQuota, GetLocalProjectQuotas, GetLocalStorageReport,
-    GetLocalUserDirs, GetLocalUserQuota, GetLocalUserQuotas, RemoveLocalProject, RemoveLocalUser,
-    SetLocalProjectQuota, SetLocalUserQuota,
+    GetLocalUserDirs, GetLocalUserQuota, GetLocalUserQuotas, IsLocalProjectAdded,
+    IsLocalProjectRemoved, IsLocalUserAdded, IsLocalUserRemoved, RemoveLocalProject,
+    RemoveLocalUser, SetLocalProjectQuota, SetLocalUserQuota,
 };
 use greatwestern::grammar::{Date, ProjectMapping, UserMapping};
-use greatwestern::storage::Quota;
+use greatwestern::storage::{Quota, Volume};
 use greatwestern::storagereport::ProjectStorageReport;
 use greatwestern::Hpc;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use templemeads::agent;
 use templemeads::agent::filesystem::{process_args, run, Defaults};
 use templemeads::agent::Type as AgentType;
@@ -142,6 +145,18 @@ async fn main() -> Result<()> {
                     remove_user_dirs(&mapping).await?;
                     job.completed_none()
                 },
+                IsLocalUserAdded(mapping) => {
+                    job.completed(are_user_dirs_added(&mapping).await?)
+                },
+                IsLocalUserRemoved(mapping) => {
+                    job.completed(are_user_dirs_removed(&mapping).await?)
+                },
+                IsLocalProjectAdded(mapping) => {
+                    job.completed(are_project_dirs_added(&mapping).await?)
+                },
+                IsLocalProjectRemoved(mapping) => {
+                    job.completed(are_project_dirs_removed(&mapping).await?)
+                },
                 GetLocalHomeDir(mapping) => {
                     let config = cache::get_filesystem_config().await?;
                     let home_dir = config.home_volume()?.home_path(&mapping)?;
@@ -243,6 +258,158 @@ async fn main() -> Result<()> {
 }
 
 ///
+/// The paths `add_local_project` creates for `mapping`, and that
+/// `remove_local_project` recycles again: every project-volume directory, the
+/// link beside any of them that is configured to have one, and the per-project
+/// root of every user volume.
+///
+/// Derived by walking exactly the same configuration in the same order as
+/// `create_project_dirs_and_links`, so that "has this been added?" cannot drift
+/// away from what adding it actually does. A path the configuration cannot
+/// produce is skipped here for the same reason it is skipped there - it was
+/// never created, so it is not evidence either way.
+///
+async fn project_paths(mapping: &ProjectMapping) -> Result<Vec<PathBuf>, Error> {
+    let config = cache::get_filesystem_config().await?;
+
+    let mut paths = Vec::new();
+
+    for (volume, volume_config) in config.get_project_volumes() {
+        for path_config in volume_config.path_configs() {
+            match path_config.path(mapping.clone().into()) {
+                Ok(path) => {
+                    if let Ok(Some(link_path)) = path_config.link_path(mapping.clone().into()) {
+                        paths.push(link_path);
+                    }
+                    paths.push(path);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Could not get project directory path for volume {}: {}",
+                        volume,
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    for (volume, volume_config) in config.get_user_volumes() {
+        for path_config in volume_config.path_configs() {
+            match path_config.project_path(mapping) {
+                Ok(path) => paths.push(path),
+                Err(error) => {
+                    tracing::warn!(
+                        "Could not get user directory root for volume {}: {}",
+                        volume,
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(paths)
+}
+
+///
+/// The paths `add_local_user` creates for `mapping`, and that
+/// `remove_local_user` recycles again - the user's own directory on every user
+/// volume. Note that this deliberately does not include the project
+/// directories `create_user_dirs` also ensures exist: those belong to the
+/// project, not to this user, and `remove_user_dirs` leaves them alone.
+///
+async fn user_paths(mapping: &UserMapping) -> Result<Vec<PathBuf>, Error> {
+    let config = cache::get_filesystem_config().await?;
+
+    let mut paths = Vec::new();
+
+    for (volume, volume_config) in config.get_user_volumes() {
+        for path_config in volume_config.path_configs() {
+            match path_config.path(mapping.clone().into()) {
+                Ok(path) => paths.push(path),
+                Err(error) => {
+                    tracing::warn!(
+                        "Could not get user directory path for volume {}: {}",
+                        volume,
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(paths)
+}
+
+///
+/// Return whether every path in `paths` exists (`want_present`) or whether
+/// none of them do (`!want_present`). The first path that disagrees is logged
+/// and decides the answer - it is the one a caller would have to re-run the
+/// add or remove to fix.
+///
+async fn all_paths_match(paths: &[PathBuf], want_present: bool) -> Result<bool, Error> {
+    let config = cache::get_filesystem_config().await?;
+    let roots = config.all_roots();
+
+    for path in paths {
+        if filesystem::path_exists(path, &roots).await? != want_present {
+            tracing::info!(
+                "Path '{}' is {} - expected it to be {}",
+                path.to_string_lossy(),
+                if want_present {
+                    "missing"
+                } else {
+                    "still present"
+                },
+                if want_present { "present" } else { "gone" }
+            );
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+///
+/// Return true only if everything `add_local_project` creates for this project
+/// is present. Read live from the filesystem - nothing here is cached.
+///
+async fn are_project_dirs_added(mapping: &ProjectMapping) -> Result<bool, Error> {
+    all_paths_match(&project_paths(mapping).await?, true).await
+}
+
+///
+/// Return true only if everything `remove_local_project` recycles for this
+/// project is gone.
+///
+async fn are_project_dirs_removed(mapping: &ProjectMapping) -> Result<bool, Error> {
+    all_paths_match(&project_paths(mapping).await?, false).await
+}
+
+///
+/// Return true only if everything `add_local_user` creates for this user is
+/// present - both their own directories and the project directories that
+/// `create_user_dirs` makes sure exist before it creates them.
+///
+async fn are_user_dirs_added(mapping: &UserMapping) -> Result<bool, Error> {
+    if !are_project_dirs_added(&mapping.project()).await? {
+        return Ok(false);
+    }
+
+    all_paths_match(&user_paths(mapping).await?, true).await
+}
+
+///
+/// Return true only if everything `remove_local_user` recycles for this user is
+/// gone. The project directories are not consulted: `remove_user_dirs` does not
+/// touch them, and they outlive any one member of the project.
+///
+async fn are_user_dirs_removed(mapping: &UserMapping) -> Result<bool, Error> {
+    all_paths_match(&user_paths(mapping).await?, false).await
+}
+
+///
 /// Create the project directories and links for a given ProjectMapping,
 ///
 async fn create_project_dirs_and_links(
@@ -251,6 +418,10 @@ async fn create_project_dirs_and_links(
 ) -> Result<(), Error> {
     let config = cache::get_filesystem_config().await?;
 
+    // The volumes on which a directory was actually created by this call. Only those
+    // are candidates for the default quota - see `set_default_project_quotas`.
+    let mut created_volumes: HashSet<Volume> = HashSet::new();
+
     // create all of the project volume directories first
     for (volume, volume_config) in config.get_project_volumes() {
         tracing::info!("Creating project volume: {}", volume);
@@ -258,14 +429,17 @@ async fn create_project_dirs_and_links(
             match path_config.path(mapping.clone().into()) {
                 Ok(path) => {
                     tracing::info!("    - Directory path to create: {}", path.to_string_lossy());
-                    filesystem::create_dir(
+                    if filesystem::create_dir(
                         &path,
                         &config.all_roots(),
                         "root",
                         mapping.local_group(),
                         path_config.permission(),
                     )
-                    .await?;
+                    .await?
+                    {
+                        created_volumes.insert(volume.clone());
+                    }
                 }
                 Err(error) => {
                     tracing::warn!("Could not get path for creation: {}", error);
@@ -313,34 +487,105 @@ async fn create_project_dirs_and_links(
         }
     }
 
-    // finally, set any default quotas
+    // finally, set the default quota on the volumes whose directories this call
+    // actually created, and only where no quota is set already
+    set_default_project_quotas(mapping, &created_volumes, expires).await?;
+
+    Ok(())
+}
+
+///
+/// Apply each project volume's configured default quota, for the volumes named in
+/// `created_volumes`.
+///
+/// The default is a **starting point for a new directory, not a policy that is
+/// re-imposed**. `add_local_project` and `add_local_user` are both re-sent for
+/// projects that already exist - the cluster agent re-runs them on a retry, and
+/// `create_user_dirs` calls `create_project_dirs_and_links` every time any member is
+/// added - so applying the default on every call silently undid quotas an operator had
+/// raised with `set_local_project_quota`. Two conditions therefore gate it:
+///
+///  1. this call created the directory on that volume (`created_volumes`), and
+///  2. the project has no quota on that volume yet.
+///
+/// A quota that cannot be read is **not** taken to be absent: an `lfs quota` that fails
+/// or times out leaves the existing limit unknown, and overwriting it on that basis is
+/// exactly the data loss this guards against. Such a volume is skipped and logged, as
+/// is any failure to set the quota itself - as before, neither fails the job.
+///
+async fn set_default_project_quotas(
+    mapping: &ProjectMapping,
+    created_volumes: &HashSet<Volume>,
+    expires: &chrono::DateTime<Utc>,
+) -> Result<(), Error> {
+    let config = cache::get_filesystem_config().await?;
+
     for (volume, volume_config) in config.get_project_volumes() {
-        if volume_config.has_quota_engine() {
-            if let Some(default_quota) = volume_config.default_quota() {
-                tracing::info!(
-                    "Setting default quota for project {} on volume {}: {}",
+        if !volume_config.has_quota_engine() {
+            continue;
+        }
+
+        let Some(default_quota) = volume_config.default_quota() else {
+            continue;
+        };
+
+        if !created_volumes.contains(&volume) {
+            tracing::info!(
+                "Not setting the default quota for project {} on volume {} - the directories \
+                 were already there, so this is not a new project directory.",
+                mapping.project(),
+                volume
+            );
+            continue;
+        }
+
+        match get_project_quota(mapping, &volume, expires).await {
+            Ok(quota) => {
+                if !quota.is_unlimited() {
+                    tracing::info!(
+                        "Not setting the default quota for project {} on volume {} - a quota \
+                         of {} is already set.",
+                        mapping.project(),
+                        volume,
+                        quota.limit()
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Not setting the default quota for project {} on volume {} - could not \
+                     read the existing quota: {}",
                     mapping.project(),
                     volume,
-                    default_quota
+                    e
                 );
+                continue;
+            }
+        }
 
-                match set_project_quota(mapping, &volume, default_quota, expires).await {
-                    Ok(_) => {
-                        tracing::info!(
-                            "Successfully set default quota for project {} on volume {}",
-                            mapping.project(),
-                            volume
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to set default quota for project {} on volume {}: {}\n Will try again later.",
-                            mapping.project(),
-                            volume,
-                            e
-                        );
-                    }
-                }
+        tracing::info!(
+            "Setting default quota for project {} on volume {}: {}",
+            mapping.project(),
+            volume,
+            default_quota
+        );
+
+        match set_project_quota(mapping, &volume, default_quota, expires).await {
+            Ok(_) => {
+                tracing::info!(
+                    "Successfully set default quota for project {} on volume {}",
+                    mapping.project(),
+                    volume
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to set default quota for project {} on volume {}: {}",
+                    mapping.project(),
+                    volume,
+                    e
+                );
             }
         }
     }
@@ -359,6 +604,10 @@ async fn create_user_dirs(
 
     let config = cache::get_filesystem_config().await?;
 
+    // The volumes on which a directory was actually created by this call. Only those
+    // are candidates for the default quota - see `set_default_user_quotas`.
+    let mut created_volumes: HashSet<Volume> = HashSet::new();
+
     for (volume, volume_config) in config.get_user_volumes() {
         tracing::info!("Creating user volume: {}", volume);
 
@@ -366,14 +615,17 @@ async fn create_user_dirs(
             match path_config.path(mapping.clone().into()) {
                 Ok(path) => {
                     tracing::info!("    - User directory to create: {}", path.to_string_lossy());
-                    filesystem::create_dir(
+                    if filesystem::create_dir(
                         &path,
                         &config.all_roots(),
                         mapping.local_user().unix()?,
                         mapping.local_group(),
                         path_config.permission(),
                     )
-                    .await?;
+                    .await?
+                    {
+                        created_volumes.insert(volume.clone());
+                    }
                 }
                 Err(error) => {
                     tracing::warn!("Could not get path for creation: {}", error);
@@ -382,33 +634,96 @@ async fn create_user_dirs(
         }
     }
 
-    // now we have created all of the directories, set any default quotas
+    // now we have created all of the directories, set the default quota on the volumes
+    // whose directories this call actually created, and only where none is set already
+    set_default_user_quotas(mapping, &created_volumes, expires).await?;
+
+    Ok(())
+}
+
+///
+/// Apply each user volume's configured default quota, for the volumes named in
+/// `created_volumes`.
+///
+/// The same two conditions as `set_default_project_quotas` gate this, and for the same
+/// reason - `add_local_user` is re-sent for users who already exist, and the default is
+/// a starting point for a new directory rather than a policy to re-impose. See there
+/// for the full rationale, including why an unreadable quota is not treated as an
+/// absent one.
+///
+async fn set_default_user_quotas(
+    mapping: &UserMapping,
+    created_volumes: &HashSet<Volume>,
+    expires: &chrono::DateTime<Utc>,
+) -> Result<(), Error> {
+    let config = cache::get_filesystem_config().await?;
+
     for (volume, volume_config) in config.get_user_volumes() {
-        if volume_config.has_quota_engine() {
-            if let Some(default_quota) = volume_config.default_quota() {
-                tracing::info!(
-                    "Setting default quota for user {} on volume {}: {}",
+        if !volume_config.has_quota_engine() {
+            continue;
+        }
+
+        let Some(default_quota) = volume_config.default_quota() else {
+            continue;
+        };
+
+        if !created_volumes.contains(&volume) {
+            tracing::info!(
+                "Not setting the default quota for user {} on volume {} - the directories \
+                 were already there, so this is not a new user directory.",
+                mapping.local_user(),
+                volume
+            );
+            continue;
+        }
+
+        match get_user_quota(mapping, &volume, expires).await {
+            Ok(quota) => {
+                if !quota.is_unlimited() {
+                    tracing::info!(
+                        "Not setting the default quota for user {} on volume {} - a quota of \
+                         {} is already set.",
+                        mapping.local_user(),
+                        volume,
+                        quota.limit()
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Not setting the default quota for user {} on volume {} - could not read \
+                     the existing quota: {}",
                     mapping.local_user(),
                     volume,
-                    default_quota
+                    e
                 );
-                match set_user_quota(mapping, &volume, default_quota, expires).await {
-                    Ok(_) => {
-                        tracing::info!(
-                            "Successfully set default quota for user {} on volume {}",
-                            mapping.local_user(),
-                            volume
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to set default quota for user {} on volume {}: {}\n Will try again later.",
-                            mapping.local_user(),
-                            volume,
-                            e
-                        );
-                    }
-                }
+                continue;
+            }
+        }
+
+        tracing::info!(
+            "Setting default quota for user {} on volume {}: {}",
+            mapping.local_user(),
+            volume,
+            default_quota
+        );
+
+        match set_user_quota(mapping, &volume, default_quota, expires).await {
+            Ok(_) => {
+                tracing::info!(
+                    "Successfully set default quota for user {} on volume {}",
+                    mapping.local_user(),
+                    volume
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to set default quota for user {} on volume {}: {}",
+                    mapping.local_user(),
+                    volume,
+                    e
+                );
             }
         }
     }

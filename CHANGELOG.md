@@ -6,6 +6,311 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+## [0.94.0] - 2026-10-08
+
+### Added
+
+- **Requeue charging.** A requeued attempt the user asked for is now charged like
+  any other usage; one the site caused is not. The rule is stated negatively,
+  because that is the direction the accounting data supports: Slurm records no
+  unambiguous account of who issued a `scontrol requeue`, but every fault the site
+  causes lands in its own terminal state (`NODE_FAIL`, `PREEMPTED`, `BOOT_FAIL`,
+  ...) and never in a bare `REQUEUED`. So the bare `REQUEUED` bucket is charged
+  and everything else - including any state a future Slurm reports that we cannot
+  name - is absorbed. See
+  [`docs/plans/slurm-requeue-charging-design.md`](docs/plans/slurm-requeue-charging-design.md).
+
+  Chosen by a new `op-slurm` option, which is the single place the decision is
+  made:
+
+  ```toml
+  requeue-policy = "charge_requeue_state_only"   # the default
+  requeue-policy = "no_charge"                   # absorb every requeue, as before
+  ```
+
+  An unrecognised value stops the agent rather than falling back to a default,
+  and the policy in force is logged at startup either way.
+- **Charged and absorbed requeues are reported separately.**
+  `DailyProjectUsageReport` gains a `charged_requeue_*` family of fields -
+  per user, per component, per state, events and wait - mirroring the existing
+  `requeue_*` ones, so a report can say how much of a project's requeueing it
+  paid for and how much the site absorbed. They describe usage already inside
+  `total_usage()`, so they are a subset of it rather than an addition to it, and
+  the consistency checks treat them as a bound. All are `#[serde(default)]`.
+- **The Slurm limit is corrected for the requeue usage the site absorbs.** Slurm
+  enforces `GrpTRESMins` against its own accumulated usage, which counts every
+  attempt - including the ones we no longer charge for - so the limit the portal
+  asks for is now raised by this month's absorbed requeue usage. `op-slurm` keeps
+  the requested limit, the correction and the applied limit as three separate
+  values; usage reports compute the correction and an hourly background task
+  writes it. The correction only ever increases within a month, is treated as
+  unknown rather than zero until it has been computed, is never added to a limit
+  of zero, and is never applied to an account Slurm holds no limit for.
+- **`get_requeue_report`** ([slurm/tools/](slurm/tools/)): an operator tool for
+  what requeueing cost one project, or the whole cluster.
+
+  ```
+  get_requeue_report myproject.brics this_month
+  get_requeue_report --cluster-wide yesterday
+  get_requeue_report --cluster-wide --by-failures last_week
+  ```
+
+  A project's report is the agent's own `requeue_report()`. Cluster-wide, it
+  reads every job on the machine and gives the charged/absorbed split, the worst
+  affected projects, a day-by-day line so an incident reads as an incident, and
+  the nodes Slurm blamed for losing work - ranked by hours lost or, with
+  `--by-failures`, by how often each failed. It has been run cluster-wide over a
+  full month on a production machine.
+- **`get_reservation_report --requeue-policy`**, so the tool splits requeued
+  attempts the same way as the agent on the cluster it is run against.
+
+### Changed
+
+- **Charging `REQUEUED` attempts changes `total_usage()`** under the new default
+  policy: it becomes the base attempts plus the charged requeues, where it was
+  the base attempts alone. Projects that checkpoint with `scontrol requeue` will
+  see their reported usage rise to match what Slurm has always counted against
+  them. `total_usage_including_requeues()` - the true total - is unchanged, as
+  is everything under `requeue-policy = "no_charge"`. Deploy at the start of an
+  accounting month so that no invoice spans the two conventions.
+- **`get_limit` no longer adopts a Slurm limit that disagrees with the cache.**
+  `op-slurm` has sole authority over the accounts it manages, and Slurm now
+  deliberately holds the requested limit plus the requeue correction, so
+  adopting what it holds would make the next correction compound on an
+  already-corrected base. A `GrpTRESMins` that differs from what `op-slurm`
+  applied is now logged at `error` and set back.
+- **`requeue_report()`** now says which of the discarded usage was charged to
+  the project and which the site absorbed, and lists the two by state
+  separately.
+- **The site portal examples now have the site dial the awards portal**, rather
+  than the other way round. Only the awards portal has to accept connections
+  from the internet; a site stays a client and can keep its whole deployment
+  behind its own firewall. The Python and Java examples share the same harness,
+  so both change.
+
+### Fixed
+
+- **A failed `sacct` day query now falls back to hourly queries however it
+  fails.** `op-slurm` only switched to hourly reporting on a wall-clock timeout,
+  so an `sacct` killed for running out of memory, stopped by a limit on the
+  scheduler's side, or cut off part-way through its JSON produced an empty,
+  uncached report - indistinguishable from a project that ran nothing. Any
+  failure now triggers the hourly fallback.
+- **An hour `sacct` cannot answer no longer loses the whole day.** It is
+  skipped and counted, and a day with a gap is never cached, so it is read again
+  on the next pass. `get_reservation_report` had no hourly fallback at all and
+  aborted the run on the first failed day; it now narrows the same way and prints
+  an `INCOMPLETE` notice naming the days and hours it could not read.
+
+## [0.93.0] - 2026-09-04
+
+### Added
+
+- **State verification instructions** — a caller can now ask whether an earlier
+  `add_user` / `add_project` / `remove_user` / `remove_project` actually ran to
+  completion, and re-run it if it did not:
+
+  ```
+  is_user_added alice.myproject.waldur
+  is_user_removed alice.myproject.waldur
+  is_project_added myproject.waldur
+  is_project_removed myproject.waldur
+  ```
+- **Requeue accounting.** `DailyProjectUsageReport` now carries the consumption
+  of superseded attempts separately from the usage it has always reported, so
+  the two can be told apart rather than merged:
+- **Expansion factor.** Usage reports now record each project's total wall-clock
+  runtime and the expansion factor of its jobs - queue time over runtime - so
+  that a project waiting a long time for a little work can be spotted. The
+  particular pattern of a job that queues for hours and then exits in seconds,
+  repeatedly, is what a user fighting a job that will not run looks like from
+  the outside.
+- **Reservations.** Usage reports now also log usage within any reservations,
+  with an associated reservation_report making this easy to query.
+- **Mean job size.** Reports now record the cores and GPUs each job was
+  allocated, giving `average_cpus_per_job()` and `average_gpus_per_job()` (and
+  per-user variants) - many small jobs against a few large ones. Usage cannot
+  answer this: the same core-seconds come from one job on a hundred cores or a
+  hundred jobs on one core, which is exactly the distinction being drawn.
+- **`get_reservation_report`** ([slurm/tools/](slurm/tools/)): an operator tool
+  that answers the question a usage report cannot. A project's report says which
+  reservations *it* used; this says which projects used a *reservation*.
+
+  ```
+  get_reservation_report interactive this_month
+  ```
+
+  The tool shares the agent's code rather than reimplementing it - the slurm
+  crate now builds a library as well as its binaries - so what it says a job
+  consumed cannot drift from what the agent says.
+- **A Java client for the bridge API** (`java/`), for a site whose portal is
+  written in Java rather than Python. The Python module talks to a bridge
+  through Rust; a Java portal has to sign its own requests, so `BridgeAuth` is
+  the reference implementation of the v2 signature - keyed BLAKE2b-256 over the
+  JSON-encoded canonical string - and is what the rest is built on.
+  `BridgeClient` covers the endpoints a portal uses (`fetch_job`,
+  `send_result`, the offerings calls, `run`, `status`, `health`), `Job` answers
+  a job without discarding the fields it did not understand, and the error
+  classes are the same six the Python module raises, encoded the same way on
+  the wire. Unit tests pin the signature against golden vectors; the
+  `Live*Check` classes drive a real bridge.
+- **Java wrappers for every type the Python module exposes**, so the Java client
+  is a complete interface rather than a connection with raw JSON behind it:
+  `AwardDetails`, the usage and storage report trees, `Allocation`, `Usage`,
+  `StorageSize`, `Quota`, `DateRange`, the identifiers and mappings,
+  `Notification`, and the health and diagnostics responses. They agree with the
+  Rust implementation by test rather than by inspection - `TypesTest` pins each
+  against strings and JSON produced by the published Python module, and every
+  composite type was round-tripped through it in both directions. The rules that
+  are not visible in a field name are the ones the javadoc leads with: an absent
+  `membership_control` means *open*, an absent `allowed_domains` means
+  *everything*, a quota with no measurement declines to report a percentage
+  rather than reporting zero, and an allocation's unit is the one every report
+  about that award has to come back in. `BridgeClient` gains `diagnostics` and
+  `restart`, and `health` and `fetch_notification` now answer typed. `Job` gains
+  `errorMessage`, `progressMessage` and typed result readers, and now refuses to
+  answer a job whose state the Rust side would refuse - a `Created` job has not
+  been handed out, so an answer to it is an answer to a question nobody asked.
+- **A Java site portal example** (`java/examples/site_portal`), answering the
+  same contract as `python/examples/site_portal` against the same walkthrough -
+  offer a resource, refuse what cannot be honoured, approve, map, push usage,
+  convert it into the award's unit, finalise a month. Verified end to end
+  against the real agents: an award created from the Python allocator comes back
+  as a typed `ManagedProjectPendingError`, then as a `ProjectMapping` once
+  approved, and 12.5 node hours pushed in read back on the allocator's side as
+  50 GPU hours attributed to `alice.myaward1.allocator`.
+
+  It shares the Python example's `example.py`, which grows an `--app
+  {python,java,none}` option, because the four agents are the same Rust binaries
+  wired the same way whichever language answers them - the thing that differs is
+  the portal, so that is what the option selects. `--app none` starts the agents
+  and no portal, for running one from an IDE.
+
+  The example needs no web framework: the operator API is served by
+  `com.sun.net.httpserver`, so its routing is twenty readable lines rather than a
+  layer of annotations. 36 tests drive every handler with no bridge running.
+
+  CI runs both, on a **Java 21** runner against the library's declared Java 17
+  target - so an API added after 17 fails the build there rather than at a site
+  running the version the library says it supports.
+
+### Fixed
+
+- **Default quotas were being incorrectly re-applied** - adding a new user to
+  a project (or anything else that triggered directory creation on the filesystem
+  agent) re-applied the default quota to that directory. This is now fixed. The
+  default quota is now only applied when a directory is created, and an existing
+  quota has not been set. You should use `get_project_quota` and
+  `set_project_quota` to inspect and modify quotas at a higher level rather
+  than relying on the default value to be set.
+- **`Job.result_type`** on the Python module, mirroring the accessor Rust and the
+  Java client already have. Most Python never needs it - `result` has already
+  used it to decide what to build - but it was the only thing about an answer
+  Python could not see, and answering an instruction with the wrong type is not a
+  failure either side detects: a well-formed value under the wrong name
+  deserialises into the wrong thing, or not at all, and nothing on the wire
+  objects. A portal's own tests are where that gets caught, and they could not
+  look. It is also what diagnoses `Unknown result type: X` - a peer answering
+  with a type newer than the module is a version mismatch rather than a fault.
+  `test_site_portal.py` now pins the type every instruction in §4 answers with.
+- **`get_awards` could not answer at all from the Python module**, and an empty
+  quota map could not be answered either. `Job.completed()` infers a result's
+  wire type from the value it is given, and the `Vec<T>` chain had no arm for a
+  list of `AwardDetails` - so a non-empty `get_awards` failed with "Could not
+  extract result type", which the site portal example then reported as an
+  internal error. The *reading* side had no `"Vec<ProjectDetails>"` arm either,
+  so even a correctly typed answer was unreadable; both halves are needed and
+  both are here. Separately, `HashMap` results were guarded with
+  `!map.is_empty()`, which made "this project has no quotas set" unsayable -
+  `completed({})` failed outright. An empty dict is unambiguous (it is the only
+  dict type in the table), so the guard is gone.
+
+  An *empty list* is left as it was, deliberately. It matches every `Vec<T>` and
+  is typed as whichever arm is tried first, and that is harmless rather than
+  wrong: `Job::result<T>()` never consults `result_type`, and the Python reader
+  turns `[]` into an empty list under any `Vec<T>` name - an empty
+  `Vec<UserIdentifier>` really is an empty `Vec<ProjectDetails>`. The name only
+  carries information once there are elements.
+
+  Found by writing a second client: the Java example answers `get_awards` with
+  the honest `Vec<ProjectDetails>`, which nothing on the Python side could read.
+  `test_site_portal.py` now covers `get_awards` - typed, non-empty and empty -
+  which no test did before, which is why this survived.
+- **The `slurmrestd` path never worked out which cluster it was talking to.**
+  `find_cluster` was only called when `op-slurm` was driving the command line, so
+  with `slurm-server` set and no `slurm-cluster` option the cluster fell back to
+  the literal `"linux"`. That name is written into the account and association
+  payloads sent over REST, and checked by `is_local_project_added`, so accounts
+  were created against a cluster that probably did not exist while every check
+  compared against the same wrong value and passed - and usage reports, which
+  query `sacct --cluster=`, came back empty. The REST path now resolves the
+  cluster too, warning rather than failing if it cannot, since a site with
+  `slurmrestd` but no local `sacctmgr` should be told what will not work rather
+  than stopped from starting.
+- **`op-cluster` no longer swallows filesystem and scheduler failures when
+  adding or removing a user or project.** All four paths now follow one policy:
+  the account agent goes first and a failure there aborts immediately, since
+  without it the mapping cannot be trusted; the filesystem and scheduler steps
+  are then both attempted, even if the first fails, because they manage separate
+  systems and there is no clean "nothing happened" to return to once the account
+  agent has been changed; and if either failed the operation returns an error
+  naming each system that failed and why.
+
+  Previously `remove_user` and `remove_project` logged a filesystem or scheduler
+  failure and returned success, so a caller was told the removal had completed
+  when the home directories were still there. They now fail, and the
+  `user_removed` / `project_removed` notification is not sent for a removal that
+  did not finish.
+- **A rename that merged two local accounts dropped one of them.** Every
+  per-user map was rebuilt with `collect()`, which keeps whichever colliding
+  entry came last, so consolidating two local usernames into one silently lost
+  one user's usage, jobs and waits - and which one depended on hash order.
+- **Scaling a `ProjectUsageReport` left its requeue and reservation figures
+  behind**, so `total_usage_including_requeues()` afterwards added two different
+  units together. `*=` and `/=` on a `DailyProjectUsageReport` also left the
+  component breakdowns unscaled while `*` and `/` scaled them.
+- **A day whose counters disagreed with its own totals was still cached.** The
+  check only logged, so the bad figures were then served from cache with nothing
+  downstream able to tell.
+- **Counters could abort the process rather than saturate.** The scalar totals
+  in a usage report saturate deliberately, but the per-user maps beside them
+  used a bare `+=`; with `overflow-checks` on and `panic = "abort"`, a
+  peer-supplied report could have killed the process before the scalar clamped.
+- **Slurm usage reports missed everything a requeued job consumed before its
+  final attempt.** `op-slurm` called `sacct` without `--duplicates`, which
+  returns only the most recent accounting record for each job id. A requeued job
+  has one record per attempt, each carrying only its own elapsed time, so every
+  attempt before the last was invisible. On a production account measured over a
+  single day this hid about a third of the account's real consumption; jobs whose
+  final attempt was cancelled before it ran were reported as having used nothing
+  at all, because the one record we saw had zero elapsed time and was discarded
+  as a non-consumer.
+- **`op-cluster` reported success for a scheduler step that had failed.** The
+  four scheduler helpers waited for their job and then asked the wrong value
+  whether it had failed:
+
+  ```rust
+  job.wait().await?;        // returns the finished job - discarded
+
+  if job.is_error() { ... } // asks the pre-wait binding, still pending
+  ```
+
+  `Job::wait` returns the finished job rather than updating the one it was
+  called on, and `Status::Error` counts as finished, so `wait` returns `Ok` for
+  a failed job and `job.is_error()` was always false. The error branch was
+  unreachable and all four returned `Ok(())` whatever the scheduler agent said.
+
+  On the remove paths this was masked, because the caller discarded the error
+  anyway (see below). On the add paths it was not: `add_user` and `add_project`
+  could report success with the Slurm account never created.
+
+  Every step now goes through one `wait_for_step`, which reads the job `wait`
+  hands back. The same stale-binding check existed in the two filesystem delete
+  helpers, where it was dead rather than wrong - `result_none()?` had already
+  turned a failed job into an error - and those are folded into the same helper.
+
+## [0.92.0] - 2026-08-21
+
 ### Added
 
 - **An example site portal** ([python/examples/site_portal/](python/examples/site_portal/)):
@@ -25,12 +330,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Nothing in it is Python-specific except the convenience of the module, so an
   equivalent in another language belongs alongside it.
-
 - **`AwardDetails()` with no arguments** gives an empty award to fill in with the
   setters, which is what code building one from scratch wants.
   `AwardDetails(json)` is unchanged - the default argument is exactly the `"{}"`
   that produced an empty award before, so no existing caller behaves differently.
-
 - **Structured errors on the wire.** A job's failure was a `String`, so every
   agent that wanted to *act* on one rather than log it had to parse prose - and
   crossing an agent boundary flattened whatever the failing agent had known. A
@@ -69,13 +372,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   message, with prose-parsing kept only as the fallback for an older peer, and
   `job.error_kind` exposes the raw kind for anything the class hierarchy does
   not cover.
-
 - **`ProjectStorageReport.to_storage_report()`**, the mirror of
   `ProjectUsageReport.to_usage_report()`. A portal answering
   `get_storage_reports` builds one project report at a time and has to lift each
   into a portal-level `StorageReport` before combining them; without this the
   path raised `AttributeError`.
-
 - **A typed error hierarchy in the `openportal` Python module**, replacing the
   hand-rolled classes and string parser that every portal implementation had to
   write for itself: `OpenPortalError` (deriving from `OSError`, so existing
@@ -83,6 +384,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `OpenPortalUnsupportedCommandError`, `ManagedProjectPermissionError`, and its
   two subclasses `ManagedProjectPendingError` and `ManagedProjectRejectedError`.
 
+  The distinction the hierarchy exists to carry is that **pending is not a
+  failure**. An award waiting on human approval has no `ProjectMapping` to
+  return, so it answers with an error — and the awarding portal must retry that
+  one while treating a rejection as final. Losing the class loses that
+  difference.
 
   A job carries one error string, so the class rides inside it as
   `"<ClassName>: <message>"`. `job.errored(exc)` encodes it, `job.error` decodes
@@ -92,17 +398,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   removed by prefix rather than by trimming a character set (which ate the start
   of any message beginning with those letters), and the message is no longer
   off-by-one for `OpenPortalError`.
-- **A specification of what a connected project portal must implement**
-  ([docs/specifications/project-portal-api.md](docs/specifications/project-portal-api.md)):
-  the requests that arrive on the bridge board, the exact result type each one must
-  return, the two-minute answering deadline, and how portal-to-portal working hangs
-  together - offerings, the `forwarded_for` tag that identifies the awarding portal,
-  and the fact that identifiers name that portal rather than the local one. Written
-  to be handed to someone connecting a new portal; `bridge-api.md` continues to
-  specify the HTTP transport itself.
-- `remove_award` is accepted as a synonym for `remove_project`, completing the
-  `*_award` spellings alongside `create_award` and `update_award`.
-
 - **A specification of what a connected site portal must implement**
   ([docs/specifications/site-portal-api.md](docs/specifications/site-portal-api.md)):
   the requests that arrive on the bridge board, the exact result type each one must
@@ -111,10 +406,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   and the fact that identifiers name that portal rather than the local one. Written
   to be handed to someone connecting a new portal; `bridge-api.md` continues to
   specify the HTTP transport itself.
-
 - `remove_award` is accepted as a synonym for `remove_project`, completing the
   `*_award` spellings alongside `create_award` and `update_award`.
-
 - `freeipa-write-server`, `freeipa-replication-window` and
   `freeipa-concurrent-writes` options for `op-freeipa`,
   and [scripts/check-replication-conflicts.sh](scripts/check-replication-conflicts.sh)
@@ -139,7 +432,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   a re-enabled user would otherwise get back the access they had before rather than what
   they are entitled to now - the same reasoning `op-freeipa` applies. The `userdel`
   configuration option is gone, being unused.
-
 - **`op-localaccount` no longer creates the home directory** (`useradd -m` is dropped).
   Home directories belong to `op-filesystem`, which creates them and recycles rather
   than deletes them, and this matches `op-freeipa`, whose `user_add` likewise only
@@ -169,7 +461,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `OpenPortalOtherError`, because the kind-first path flattened everything it
   could not place; it now defers to the message in that case, which is what the
   older prose-only path always did.
-
 - **`AwardDetails.set_allowed_domains([])` meant the opposite of what it said.**
   The setter normalised an empty list to `None`, so the strictest setting a
   caller could ask for - permit nobody - silently became the most permissive
@@ -186,7 +477,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `clear_allowed_domains()` and passing `None` remain the ways to reach "no
   restriction". `from_json`, `to_json` and `merge` already preserved the empty
   list, so the setter was the only path that lost it.
-
 - **`update_award` could widen an allow-list but never narrow it.** `merge`
   took the union of the two lists, so a domain once granted could not be
   withdrawn and an empty list sent to a project that already had entries was a
@@ -199,7 +489,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   still changes nothing. The fields that accumulate on merge are `notes` (an
   audit trail) and `breakdown`, and they still do; `add_allowed_domain` remains
   the incremental path for a portal building a list up locally.
-
 - Documentation: `python-api.md` listed a `Status.expired()` that does not
   exist - expiry is not one of the six job states, and is read from
   `job.is_expired` - and omitted `Status.created()`, which does.
@@ -209,7 +498,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `RuntimeError{…}` was correct. Both reached the portal with doubled braces, so
   a portal matching the documented `ExpirationError{}` never matched. They now
   say what they are documented to say.
-
 - **OpenPortal was creating LDAP replication conflicts in multi-master FreeIPA
   topologies.** A site reported 67 `namingConflict` entries accumulated over 11
   months - 29 project groups, 19 users and their 19 server-generated private groups -
@@ -249,13 +537,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   Every `freeipa-server` entry must name an individual master for this to hold: a VIP
   or a round-robin DNS alias is several masters behind one name.
-
 - **A 401 from FreeIPA could hang a job until its deadline.** The replay path
   reconnected - possibly to a different server - but reused the URL built from the
   original one, so it posted the new server's session cookie to the old server, which
   401s again. The URL is now rebuilt from the server actually being addressed, and the
   replay is bounded.
-
 - **An empty home directory stopped a recycled one from being restored.** `create_dir`
   treated any existing directory as the finished article, so an account agent that
   creates a home when it creates the account left `op-filesystem` looking at an empty
@@ -269,7 +555,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   non-recursive `remove_dir`; `EXPECTED_SKEL_FILES` names the unsurprising ones so
   anything else is logged loudly rather than passing silently. Nothing here can remove a
   subtree even if those checks are ever wrong.
-
 - **A directory restored from `.recycle` kept its old ownership.** Restoring moved the
   directory back and stopped there, so a user volume restored for an account that had
   been deleted and recreated came back owned by the *old* uid - which that user no
@@ -285,7 +570,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   walking a tree of unbounded size does not belong inside a job with an answering
   deadline, so the warning names both id pairs and says plainly that a recursive chown
   may still be needed.
-
 - **`op-filesystem` intermittently failed to resolve users and groups that exist.**
   Jobs failed with `Could not find a group called <name>` or `Could not search for
   group <name>: EIO: I/O error` for groups that `getent group` on the same node
@@ -315,7 +599,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   rather than silently resolving names through some other program - a `getent`
   appearing or disappearing under a running agent means something is wrong with the
   host, not that a different binary should be picked up.
-
 - **A name that could not be looked up was reported as a name that does not exist.**
   The two are now distinguished. A genuine absence - every source on the host was asked
   and none knows the name - fails immediately and says so. An indeterminate lookup
@@ -328,7 +611,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `op-filesystem`'s Lustre quota engine had a second, separate copy of this logic
   (`id -u` and `getent group`, with a `/etc/group` fallback that treated a local miss
   as authoritative). It now shares the one implementation.
-
 - **A portal could not report its members.** `get_users` returns each member's email
   address as the `UserMapping` local user - the portal-level equivalent of a Unix
   username - but mapping validation rejected `@`, so every such mapping failed to
@@ -342,7 +624,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   an RPC parameter. Nothing that reaches a Unix account, Slurm, FreeIPA or a
   filesystem path accepts the wider charset. `local_group` is unchanged: it names a
   Unix group at every layer.
-
 - Documentation errors in [docs/specifications/json-types.md](docs/specifications/json-types.md):
   `get_projects` returns `Vec<ProjectMapping>` (not `Vec<ProjectDetails>`), `get_users`
   returns `Vec<UserMapping>` (not `Vec<UserIdentifier>`), and `get_project` returns
@@ -2356,6 +2637,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Initial release
   This is an initial alpha release of the OpenPortal project. It is not yet feature complete and is not recommended for production use.
 
+[0.94.0]: https://github.com/isambard-sc/openportal/releases/tag/0.94.0
+[0.93.0]: https://github.com/isambard-sc/openportal/releases/tag/0.93.0
+[0.92.0]: https://github.com/isambard-sc/openportal/releases/tag/0.92.0
 [0.91.0]: https://github.com/isambard-sc/openportal/releases/tag/0.91.0
 [0.90.0]: https://github.com/isambard-sc/openportal/releases/tag/0.90.0
 [0.32.2]: https://github.com/isambard-sc/openportal/releases/tag/0.32.2
